@@ -242,8 +242,8 @@ class TMWebDriver:
         if newtabs: rr['newTabs'] = newtabs
         return rr
     
-    def _remote_cmd(self, cmd):
-        return requests.post(self.remote, headers={"Content-Type": "application/json"}, json=cmd).json()
+    def _remote_cmd(self, cmd, timeout=30):
+        return requests.post(self.remote, headers={"Content-Type": "application/json"}, json=cmd, timeout=timeout).json()
 
     def get_all_sessions(self):  
         if self.is_remote:
