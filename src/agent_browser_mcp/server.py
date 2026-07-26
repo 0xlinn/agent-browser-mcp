@@ -123,6 +123,16 @@ def get_driver() -> TMWebDriver:
 
 def require_driver() -> TMWebDriver:
     driver = get_driver()
+    # A remote driver outlives the bridge it points at. get_driver only spawns
+    # on first construction, so a daemon that dies later would leave every
+    # existing MCP instance erroring forever; this check lets any tool call
+    # resurrect it.
+    if (
+        driver.is_remote
+        and os.environ.get("AGENT_BROWSER_NO_SPAWN") != "1"
+        and not _port_open(_DRIVER_HOST, _DRIVER_PORT + 1)
+    ):
+        spawn_bridge_daemon()
     return driver
 
 

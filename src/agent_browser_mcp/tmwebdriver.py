@@ -62,6 +62,12 @@ class TMWebDriver:
             self.start_http_server()
         else:
             self.remote = f'http://{self.host}:{self.port+1}/link'
+            # trust_env=False: HTTP(S)_PROXY env vars (no NO_PROXY) would route
+            # loopback bridge calls through the system proxy — a restart there
+            # surfaces as 502/refused, i.e. phantom bridge outages. Session
+            # also gives us connection pooling for repeated calls.
+            self._http = requests.Session()
+            self._http.trust_env = False
 
     def _acquire_host_lock(self):
         s = socket.socket()
@@ -318,7 +324,7 @@ class TMWebDriver:
         return rr
     
     def _remote_cmd(self, cmd, timeout=30):
-        return requests.post(self.remote, headers={"Content-Type": "application/json"}, json=cmd, timeout=timeout).json()
+        return self._http.post(self.remote, headers={"Content-Type": "application/json"}, json=cmd, timeout=timeout).json()
 
     def get_all_sessions(self, timeout=None):
         if self.is_remote:
