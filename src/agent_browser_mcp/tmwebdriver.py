@@ -145,9 +145,14 @@ class TMWebDriver:
                         tabs = data.get('tabs', [])
                         # Namespace sessions per browser instance so Chrome/Edge (and
                         # multiple profiles) don't collide on identical small tab ids.
-                        # Fall back to the connection identity if an older extension
-                        # doesn't send clientId.
-                        client_id = data.get('clientId') or f"conn{id(self)}"
+                        # Fall back to a per-connection uuid if an older extension
+                        # doesn't send clientId — id(self) is unusable here because
+                        # addresses get reused after GC, colliding namespaces.
+                        client_id = data.get('clientId')
+                        if not client_id:
+                            if not hasattr(self, '_fallback_cid'):
+                                self._fallback_cid = f"conn_{uuid.uuid4().hex[:10]}"
+                            client_id = self._fallback_cid
                         browser = data.get('browser', '')
                         def _sid(tab_id): return f"{client_id}:{tab_id}"
                         current_tab_ids = {_sid(tab['id']) for tab in tabs}
