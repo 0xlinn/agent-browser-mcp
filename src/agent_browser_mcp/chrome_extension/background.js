@@ -397,12 +397,21 @@ function getBrowserType() {
 }
 async function getClientId() {
   if (CLIENT_ID) return CLIENT_ID;
-  const s = await chrome.storage.local.get('tmwd_client_id');
-  if (s.tmwd_client_id) { CLIENT_ID = s.tmwd_client_id; return CLIENT_ID; }
-  // Per-profile: chrome.storage.local is isolated per profile, so two profiles of the
-  // same browser get distinct ids too.
-  CLIENT_ID = getBrowserType() + '_' + Math.random().toString(36).slice(2, 8);
-  await chrome.storage.local.set({ tmwd_client_id: CLIENT_ID });
+  // storage MUST NOT be able to sink the whole registration path: if the
+  // permission is missing or the API throws, a missing clientId only costs us
+  // cross-restart id stability, whereas an exception here kills ext_ready /
+  // tabs_update entirely (server registers 0 sessions). Degrade, don't crash.
+  try {
+    const s = await chrome.storage.local.get('tmwd_client_id');
+    if (s.tmwd_client_id) { CLIENT_ID = s.tmwd_client_id; return CLIENT_ID; }
+    // Per-profile: chrome.storage.local is isolated per profile, so two profiles of the
+    // same browser get distinct ids too.
+    CLIENT_ID = getBrowserType() + '_' + Math.random().toString(36).slice(2, 8);
+    await chrome.storage.local.set({ tmwd_client_id: CLIENT_ID });
+  } catch (e) {
+    console.error('[TMWD-WS] storage unavailable, using ephemeral clientId', e);
+    if (!CLIENT_ID) CLIENT_ID = getBrowserType() + '_' + Math.random().toString(36).slice(2, 8);
+  }
   return CLIENT_ID;
 }
 

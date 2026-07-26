@@ -10,6 +10,7 @@
     "debugger",
     "scripting",
     "alarms",
+    "storage",
     "declarativeNetRequest",
     "management",
     "bookmarks"
