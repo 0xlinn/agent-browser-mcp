@@ -378,6 +378,10 @@ function buildCdpScript(code) {
 // --- WebSocket Client for TMWebDriver ---
 let ws = null;
 let connectInFlight = false;
+// Last time the bridge answered our ping with a pong. A half-open zombie
+// socket stays readyState===OPEN and accepts send() without error, so pong
+// silence is the only reliable "this TCP connection is actually dead" signal.
+let lastPongAt = 0;
 const WS_URL = 'ws://127.0.0.1:18765';
 const HTTP_PROBE = 'http://127.0.0.1:18766/link';
 
@@ -449,9 +453,33 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     return;
   }
   if (alarm.name === 'tmwd-ws-keepalive') {
-    // Keepalive: ping to keep SW alive + detect dead connections
+    // Keepalive: ping to keep SW alive + detect dead / half-open connections.
+    // After bridge restart the socket can stay OPEN client-side while the new
+    // daemon has an empty session table — re-push tabs every tick so MCP recovers.
     if (ws && ws.readyState === WebSocket.OPEN) {
-      try { ws.send('{"type":"ping"}'); } catch (_) {}
+      // Zombie check: on a half-open socket send() succeeds silently and the
+      // OS won't surface the dead peer for minutes, so we'd keep pushing tabs
+      // into a black hole. If the bridge hasn't pong'd across two full ticks
+      // (~48s), treat the socket as dead and force a fresh connect.
+      if (lastPongAt && Date.now() - lastPongAt > 55000) {
+        console.log('[TMWD-WS] pong timeout, forcing reconnect');
+        try { ws.close(); } catch (_) {}
+        ws = null;
+        lastPongAt = 0;
+        ensureConnected('keepalive-pong-timeout');
+        scheduleProbe();
+        return;
+      }
+      try {
+        ws.send('{"type":"ping"}');
+        // fire-and-forget re-register; must not block the alarm handler
+        sendTabsUpdate();
+      } catch (_) {
+        ws = null;
+        ensureConnected('keepalive-send-failed');
+        scheduleProbe();
+        return;
+      }
       scheduleKeepalive();
     } else {
       // Connection lost, switch to probe mode
@@ -559,6 +587,10 @@ function connectWS() {
   ws.onopen = async () => {
     connectInFlight = false;
     console.log('[TMWD-WS] Connected!');
+    // Seed the pong clock so the zombie watchdog has a baseline; the bridge's
+    // first pong (within a keepalive tick) refreshes it. Without a seed the
+    // watchdog's `lastPongAt &&` guard would never arm.
+    lastPongAt = Date.now();
     scheduleKeepalive(); // Keep SW alive while connected
     try {
       const clientId = await getClientId();
@@ -577,6 +609,7 @@ function connectWS() {
   ws.onmessage = async (event) => {
     try {
       const data = JSON.parse(event.data);
+      if (data.type === 'pong') { lastPongAt = Date.now(); return; }
       if (data.id && data.code) {
         let code = data.code;
         // If code is a JSON string representing an object, parse it
@@ -622,6 +655,11 @@ chrome.runtime.onInstalled.addListener(() => ensureConnected('onInstalled'));
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg && msg.cmd === 'tmwd_ping') {
     ensureConnected('runtime-message');
+    // Badge click / content-script poll is a free chance to re-register tabs
+    // against a bridge that restarted while our socket looked healthy.
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      try { sendTabsUpdate(); } catch (_) {}
+    }
     sendResponse({
       ok: true,
       ws: !!(ws && ws.readyState === WebSocket.OPEN),

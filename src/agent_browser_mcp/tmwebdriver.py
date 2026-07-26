@@ -203,6 +203,13 @@ class TMWebDriver:
                             sess = driver.sessions.get(session_id)
                             if sess and sess.is_active(): sess.info = session_info
                             else: driver._register_client(session_id, self, session_info)
+                    elif data.get('type') == 'ping':
+                        # Liveness reply so the extension can tell a live socket
+                        # from a half-open zombie (TCP ESTABLISHED but dead). No
+                        # pong within a couple keepalive ticks => extension force-
+                        # reconnects instead of pushing tabs into a black hole.
+                        try: self.send_message(json.dumps({'type': 'pong'}))
+                        except Exception: pass
                     elif data.get('type') == 'ack': driver.acks[data.get('id','')] = time.time()
                     elif data.get('type') == 'result':
                         driver.results[data.get('id')] = {'success': True, 'data': data.get('result'), 'newTabs': data.get('newTabs', []), 'ts': time.time()}
