@@ -43,11 +43,37 @@ class TMWebDriver:
         with socket.socket() as _probe:
             _probe.settimeout(1)
             self.is_remote = _probe.connect_ex((host, port+1)) == 0
-        if not self.is_remote:  
-            self.start_ws_server()  
+        if not self.is_remote:
+            # Both bundled servers set SO_REUSEADDR, which on Windows lets a
+            # second process bind the very same ports and steal a share of the
+            # connections (extension on one host, /link on the other -> lost
+            # results). An exclusive lock socket on port+2 guarantees exactly
+            # one host; losers wait for the winner and go remote.
+            self._host_lock = self._acquire_host_lock()
+            if self._host_lock is None:
+                for _ in range(20):
+                    time.sleep(0.25)
+                    with socket.socket() as s:
+                        s.settimeout(1)
+                        if s.connect_ex((host, port + 1)) == 0: break
+                self.is_remote = True
+        if not self.is_remote:
+            self.start_ws_server()
             self.start_http_server()
         else:
             self.remote = f'http://{self.host}:{self.port+1}/link'
+
+    def _acquire_host_lock(self):
+        s = socket.socket()
+        try:
+            if hasattr(socket, 'SO_EXCLUSIVEADDRUSE'):
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            s.bind((self.host, self.port + 2))
+            s.listen(1)
+            return s  # held open for the process lifetime
+        except OSError:
+            s.close()
+            return None
 
     def start_http_server(self):
         self.app = app = bottle.Bottle()
