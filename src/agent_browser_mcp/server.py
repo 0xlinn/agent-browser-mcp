@@ -78,7 +78,9 @@ def spawn_bridge_daemon() -> bool:
     instance is avoided because these instances are spawned per session and
     recycled, taking the bridge (and its bound ports) down with them.
     """
-    cmd = [sys.executable, "-m", "agent_browser_mcp.bridge"]
+    # -u: unbuffered, so daemon tracebacks reach bridge.log immediately
+    # instead of dying in a block buffer that never flushes.
+    cmd = [sys.executable, "-u", "-m", "agent_browser_mcp.bridge"]
     kwargs: dict[str, Any] = {
         "stdin": subprocess.DEVNULL,
         "close_fds": True,

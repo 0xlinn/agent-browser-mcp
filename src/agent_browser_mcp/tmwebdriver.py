@@ -216,11 +216,37 @@ class TMWebDriver:
                 print(f"WS Connection closed: {self.address}")
                 driver._unregister_client(self)  
         
-        self.server = WebSocketServer(self.host, self.port, JSExecutor)  
-        server_thread = threading.Thread(target=self.server.serve_forever)  
-        server_thread.daemon = True  
-        server_thread.start()  
-        print(f"WebSocket server running on ws://{self.host}:{self.port}")  
+        # First bind stays in the caller's thread so startup failures are loud.
+        self.server = WebSocketServer(self.host, self.port, JSExecutor)
+
+        def run():
+            # serve_forever has no internal guard: any exception that escapes
+            # the poll loop silently kills the thread while the LISTEN socket
+            # keeps accepting into the kernel backlog - clients show
+            # ESTABLISHED but no handshake ever completes. Rebuild and go on.
+            srv = self.server
+            while True:
+                try:
+                    srv.serve_forever()
+                except Exception:
+                    print("WS server loop crashed; rebuilding in 1s")
+                    traceback.print_exc()
+                try:
+                    srv.close()
+                except Exception:
+                    pass
+                time.sleep(1)
+                try:
+                    srv = self.server = WebSocketServer(self.host, self.port, JSExecutor)
+                    print(f"WS server rebuilt on ws://{self.host}:{self.port}")
+                except Exception:
+                    traceback.print_exc()
+                    time.sleep(2)
+
+        server_thread = threading.Thread(target=run)
+        server_thread.daemon = True
+        server_thread.start()
+        print(f"WebSocket server running on ws://{self.host}:{self.port}")
     
     def _register_client(self, session_id: str, client: WebSocket, session_info) -> None:  
         is_new_session = session_id not in self.sessions
