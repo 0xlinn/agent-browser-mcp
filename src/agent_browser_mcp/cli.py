@@ -43,10 +43,15 @@ def cmd_doctor() -> int:
     http_port = ws_port + 1
     sessions = []
     err = None
+    diag = None
     try:
         sessions = driver.get_all_sessions()
     except Exception as e:
         err = str(e)
+    try:
+        diag = driver.diagnose()
+    except Exception as e:
+        diag = {"cause": "diagnose_failed", "ok": False, "error": str(e)}
     payload = {
         "extension_path": str(chrome_extension_dir()),
         "config_js": str((chrome_extension_dir() / 'config.js').resolve()),
@@ -58,6 +63,7 @@ def cmd_doctor() -> int:
         "http_port_open": _port_open(getattr(driver, "host", "127.0.0.1"), http_port),
         "connected_tabs": len(sessions),
         "tabs": sessions,
+        "diagnosis": diag,
         "error": err,
         "next_steps": [
             "Load the unpacked extension in chrome://extensions from extension_path.",
@@ -66,6 +72,10 @@ def cmd_doctor() -> int:
         ],
     }
     print(json.dumps(payload, ensure_ascii=False, indent=2))
+    # Surface the one-line verdict last so it's the first thing the eye lands on.
+    if isinstance(diag, dict) and diag.get("advice"):
+        mark = "OK" if diag.get("ok") else "!!"
+        print(f"\n[{mark}] {diag.get('cause')}: {diag.get('advice')}", file=sys.stderr)
     return 0
 
 

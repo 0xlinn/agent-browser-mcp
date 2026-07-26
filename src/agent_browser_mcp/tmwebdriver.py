@@ -38,8 +38,15 @@ class TMWebDriver:
     def __init__(self, host: str = '127.0.0.1', port: int = 18765):  
         self.host, self.port = host, port
         self.sessions, self.results, self.acks = {}, {}, {}
-        self.default_session_id = None  
-        self.latest_session_id = None  
+        self.default_session_id = None
+        self.latest_session_id = None
+        # Last time ANY extension pushed ext_ready/tabs_update. Lets `doctor`
+        # tell "extension never registered" (0 or stale) from "registered but
+        # just dropped" — the single most useful signal for classifying why
+        # /link is empty. None until the first registration this daemon sees.
+        self.last_ext_seen = None
+        # Per-client last-seen: which browser is stale vs which just dropped.
+        self.client_last_seen = {}
         with socket.socket() as _probe:
             _probe.settimeout(1)
             self.is_remote = _probe.connect_ex((host, port+1)) == 0
@@ -120,7 +127,8 @@ class TMWebDriver:
         @app.route('/link', method=['GET','POST'])
         def link():
             data = request.json
-            if data.get('cmd') == 'get_all_sessions': return json.dumps({'r': self.get_all_sessions()}, ensure_ascii=False)  
+            if data.get('cmd') == 'get_all_sessions': return json.dumps({'r': self.get_all_sessions()}, ensure_ascii=False)
+            if data.get('cmd') == 'diagnose': return json.dumps({'r': self.diagnose()}, ensure_ascii=False)
             if data.get('cmd') == 'find_session': 
                 url_pattern = data.get('url_pattern', '')
                 return json.dumps({'r': self.find_session(url_pattern)}, ensure_ascii=False)
@@ -186,6 +194,8 @@ class TMWebDriver:
                                 self._fallback_cid = f"conn_{uuid.uuid4().hex[:10]}"
                             client_id = self._fallback_cid
                         browser = data.get('browser', '')
+                        driver.last_ext_seen = time.time()
+                        if client_id: driver.client_last_seen[client_id] = {'ts': time.time(), 'browser': browser}
                         def _sid(tab_id): return f"{client_id}:{tab_id}"
                         current_tab_ids = {_sid(tab['id']) for tab in tabs}
                         print(f"Received tabs update from {client_id} ({browser}): {current_tab_ids}")
@@ -368,7 +378,50 @@ class TMWebDriver:
 
     def get_session_dict(self, timeout=None):
         return {session['id']: session['url'] for session in self.get_all_sessions(timeout=timeout)}
-        
+
+    def diagnose(self, timeout=None):
+        """Classify why the bridge might be unusable, mapping to SKILL.md causes.
+
+        Returns a dict the CLI/MCP `doctor` prints so the user never has to run
+        netstat + curl + read the badge by hand. `cause` is the machine-readable
+        verdict; `advice` is the one-line human fix.
+        """
+        if self.is_remote:
+            # We're a thin client; ask the real host for its self-diagnosis.
+            try:
+                return self._remote_cmd({"cmd": "diagnose"}, timeout=timeout or 6).get('r', {})
+            except Exception as e:
+                return {"cause": "bridge_unreachable", "ok": False,
+                        "advice": "桥守护无响应/端口拒绝 → 通常自动拉起；否则手动跑 python -m agent_browser_mcp.bridge (SKILL 成因1)",
+                        "error": str(e)}
+        self.clean_sessions()
+        active = [s for s in self.sessions.values() if s.is_active()]
+        now = time.time()
+        ever = self.last_ext_seen is not None
+        stale = ever and (now - self.last_ext_seen) > 90
+        per_client = {cid: {"browser": v.get("browser", ""), "seconds_ago": round(now - v["ts"], 1)}
+                      for cid, v in self.client_last_seen.items()}
+        if active:
+            cause, ok, advice = "healthy", True, f"{len(active)} 个 tab 已注册，桥+扩展都通。"
+        elif not ever:
+            cause, ok, advice = "ext_never_registered", False, (
+                "扩展从没连过桥：① chrome://extensions 看有无红色 Errors(成因2a storage权限) "
+                "② 扩展是否被禁用(2b) ③ 是否没开任何 http(s) 页面。")
+        elif stale:
+            cause, ok, advice = "sw_slept_or_dropped", False, (
+                f"扩展曾注册但已 {round(now - self.last_ext_seen)}s 无心跳：多半 SW 睡死(成因2d)。"
+                "开着的正常网页应在 5s 内自愈；否则 chrome://extensions 点 ↻ reload。")
+        else:
+            cause, ok, advice = "registering", False, (
+                "扩展刚有心跳但当前 0 活跃 tab：正在注册/所有 tab 都是 chrome:// 或空白页，稍等或打开一个 http(s) 页面。")
+        return {
+            "cause": cause, "ok": ok, "advice": advice,
+            "active_tabs": len(active),
+            "ever_registered": ever,
+            "last_ext_seen_seconds_ago": round(now - self.last_ext_seen, 1) if ever else None,
+            "clients": per_client,
+        }
+
     def find_session(self, url_pattern: str):
         if url_pattern == '':
             session = self.sessions.get(self.latest_session_id)
