@@ -1,11 +1,22 @@
 ;(function(){ if (/streamlit/i.test(document.title)) return;
 
+// Idempotency guard: onInstalled re-injects this script into already-open
+// tabs (to rebind orphaned content scripts after an extension reload). Without
+// this, each reload would stack another badge + MutationObserver + 5s interval
+// on top of the dead ones. A window flag is per-execution-world, so a fresh
+// injection into the same page still sees the previous run's flag and bails.
+if (window.__tmwd_content_loaded) return;
+window.__tmwd_content_loaded = true;
+
 // Remove meta CSP tags
 document.querySelectorAll('meta[http-equiv="Content-Security-Policy"]').forEach(e => e.remove());
 
 // Indicator badge — reflects real WS status via background (green=bridge, orange=inject-only)
 (function(){
   if(window.self!==window.top)return;
+  // Drop any badge left by an orphaned older injection so we don't double up.
+  const stale = document.getElementById('ljq-ind');
+  if (stale) stale.remove();
   const d=document.createElement('div');
   d.id='ljq-ind';
   d.innerText='ljq_driver: 检测中';
@@ -14,21 +25,26 @@ document.querySelectorAll('meta[http-equiv="Content-Security-Policy"]').forEach(
     d.innerText = ok ? 'ljq_driver: 已连接' : 'ljq_driver: 桥未连';
     d.style.background = ok ? '#4CAF50' : '#e67e22';
   }
-  d.addEventListener('click',()=>{
+  // An orphaned content script (extension reloaded under it) throws
+  // "Extension context invalidated" on any chrome.* call. Tell the user to
+  // refresh instead of silently sticking on "检测中" forever.
+  function orphaned(){
+    d.innerText = 'ljq_driver: 请刷新页面';
+    d.style.background = '#c0392b';
+  }
+  function poll(withAlert){
     try {
       chrome.runtime.sendMessage({cmd:'tmwd_ping'}, (r)=>{
+        if (chrome.runtime.lastError) { orphaned(); return; }
         paint(!!(r && r.ws));
-        alert((r && r.ws ? '桥已连接' : '桥未连接') + '\nURL: '+location.href+'\nreadyState='+(r?r.readyState:'?'));
+        if (withAlert) alert((r && r.ws ? '桥已连接' : '桥未连接') + '\nURL: '+location.href+'\nreadyState='+(r?r.readyState:'?'));
       });
-    } catch(e) { alert('扩展消息失败: '+e.message); }
-  });
+    } catch(e) { orphaned(); }
+  }
+  d.addEventListener('click',()=>poll(true));
   (document.body||document.documentElement).appendChild(d);
-  try {
-    chrome.runtime.sendMessage({cmd:'tmwd_ping'}, (r)=> paint(!!(r && r.ws)));
-  } catch(_) { paint(false); }
-  setInterval(()=>{
-    try { chrome.runtime.sendMessage({cmd:'tmwd_ping'}, (r)=> paint(!!(r && r.ws))); } catch(_) {}
-  }, 5000);
+  poll(false);
+  setInterval(()=>poll(false), 5000);
 })();
 
 new MutationObserver(muts => {

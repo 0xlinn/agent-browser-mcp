@@ -13,7 +13,32 @@ chrome.runtime.onInstalled.addListener(() => {
       condition: { urlFilter: '*', resourceTypes: ['main_frame', 'sub_frame'] }
     }]
   });
+  // Re-inject content scripts into already-open pages. After an extension
+  // reload, pages opened under the OLD extension keep running orphaned
+  // content.js whose chrome.runtime points at a dead context — their badge
+  // sticks on "检测中" until a manual refresh. Re-injecting rebinds them to
+  // this fresh SW so the user never has to reload each tab by hand. (WS tab
+  // registration never depended on content.js; this only fixes the badge/UX.)
+  reinjectAllTabs();
 });
+
+async function reinjectAllTabs() {
+  let tabs;
+  try { tabs = await chrome.tabs.query({}); } catch (_) { return; }
+  for (const tab of tabs) {
+    if (!tab.id || !isScriptable(tab.url)) continue;
+    try {
+      // config.js defines TID which content.js reads; must load in order.
+      await chrome.scripting.executeScript({
+        target: { tabId: tab.id, allFrames: true },
+        files: ['config.js', 'content.js'],
+      });
+    } catch (_) {
+      // Restricted pages (web store, chrome://, PDF viewer) reject injection;
+      // skip them silently — they were never scriptable anyway.
+    }
+  }
+}
 
 async function handleExtMessage(msg, sender) {
   if (msg.cmd === 'cookies') return await handleCookies(msg, sender);
