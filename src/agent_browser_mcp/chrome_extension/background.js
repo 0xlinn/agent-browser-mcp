@@ -685,6 +685,19 @@ function connectWS() {
 ensureConnected('boot');
 chrome.runtime.onStartup.addListener(() => ensureConnected('onStartup'));
 chrome.runtime.onInstalled.addListener(() => ensureConnected('onInstalled'));
+// Long-lived port from content scripts. Establishing a port is a stronger SW
+// wake signal than sendMessage — and merely re-instantiating the dead SW runs
+// this file top-to-bottom, hitting ensureConnected('boot') above. We also kick
+// a connect here so a freshly-woken SW re-registers tabs without waiting for
+// the next 5s poll.
+chrome.runtime.onConnect.addListener((port) => {
+  if (port.name !== 'tmwd_keepalive') return;
+  ensureConnected('port-connect');
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    try { sendTabsUpdate(); } catch (_) {}
+  }
+  port.onDisconnect.addListener(() => { /* content side will reconnect */ });
+});
 // Popup / content can poke SW awake
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg && msg.cmd === 'tmwd_ping') {

@@ -43,8 +43,21 @@ document.querySelectorAll('meta[http-equiv="Content-Security-Policy"]').forEach(
   }
   d.addEventListener('click',()=>poll(true));
   (document.body||document.documentElement).appendChild(d);
+  // Long-lived port: re-opening a port is a stronger, cheaper SW wake signal
+  // than sendMessage, and it lets a dead SW re-instantiate + reconnect the
+  // bridge on its own — this is what turns "SW slept, must reload extension"
+  // into "self-heals within 5s". The ping below just reads status for the badge.
+  function wakeSW(){
+    try {
+      const p = chrome.runtime.connect({ name: 'tmwd_keepalive' });
+      // Swallow the disconnect; the next poll re-opens. Reading lastError here
+      // avoids an unchecked-error console warning when the SW is mid-restart.
+      p.onDisconnect.addListener(()=>{ void chrome.runtime.lastError; });
+    } catch(_) { /* orphaned; poll() will paint the refresh hint */ }
+  }
+  wakeSW();
   poll(false);
-  setInterval(()=>poll(false), 5000);
+  setInterval(()=>{ wakeSW(); poll(false); }, 5000);
 })();
 
 new MutationObserver(muts => {
