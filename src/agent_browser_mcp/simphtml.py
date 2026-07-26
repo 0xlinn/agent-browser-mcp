@@ -824,6 +824,17 @@ def smart_truncate(soup, budget, _depth=0):
 MONITOR_TIMEOUT = 6
 MONITOR_MAXCHARS = 300000
 
+def no_response_kind(response):
+    """Classify a driver timeout pseudo-result. 'undelivered' means the script
+    never reached the page (safe to retry); 'after_ack' means it was delivered
+    and may still be running (retrying could double side effects)."""
+    if not isinstance(response, dict) or 'data' in response: return None
+    msg = response.get('result')
+    if not isinstance(msg, str): return None
+    if 'no ACK' in msg or 'script not polled' in msg: return 'undelivered'
+    if 'ACK received' in msg or 'delivered but no result' in msg: return 'after_ack'
+    return None
+
 def execute_js_rich(script, driver, no_monitor=False, timeout=15, before_sids=None):
     last_html = None
     if not no_monitor:
@@ -838,6 +849,11 @@ def execute_js_rich(script, driver, no_monitor=False, timeout=15, before_sids=No
     try:
         print(f"Executing: {script[:250]} ...")
         response = driver.execute_js(script, timeout=timeout)
+        if no_response_kind(response) == 'undelivered':
+            # Never reached the page (session asleep / SW reconnecting):
+            # retrying is side-effect-free.
+            print("No ACK; retrying once...")
+            response = driver.execute_js(script, timeout=timeout)
         result = response['data'] if 'data' in response else response.get('result')
         if response.get('closed', 0) == 1: reloaded = True
         time.sleep(1)
@@ -852,8 +868,20 @@ def execute_js_rich(script, driver, no_monitor=False, timeout=15, before_sids=No
         "tab_id": driver.default_session_id
     }
     if reloaded: rr['reloaded'] = reloaded
+    if response.get('switched_session'):
+        rr['switched_session'] = response['switched_session']
+        rr['switched_from'] = response.get('switched_from')
+        rr['switch_note'] = "原会话已断开，本次已在同浏览器的另一会话执行；如目标不对请 list_tabs 后 switch_tab。"
+    kind = no_response_kind(response)
+    if kind and not error_msg:
+        rr['status'] = 'no_response'
+        rr['suggestion'] = (
+            "脚本未送达（已自动重试1次仍无ACK）：会话可能休眠或断开。先 list_tabs 确认目标，switch_tab 后重试。"
+            if kind == 'undelivered' else
+            "脚本已送达但超时未返回：可能仍在执行或页面被阻塞（如验证码）。勿盲目重试有副作用的脚本，先 scan_page 查看当前状态，或加大 timeout 重试只读脚本。"
+        )
     if response.get('newTabs'): rr['newTabs'] = response['newTabs']
-    elif not error_msg:
+    elif not error_msg and not kind:
         try:
             after = driver.get_session_dict(timeout=MONITOR_TIMEOUT)
             new_sids = {k: v for k, v in after.items() if k not in before_sids}
@@ -863,7 +891,8 @@ def execute_js_rich(script, driver, no_monitor=False, timeout=15, before_sids=No
             rr['newTabs'] = newTabs
             rr['suggestion'] = "页面已刷新，以上新标签页在执行期间连接。"
     if error_msg: rr['error'] = error_msg
-    if no_monitor: return rr
+    # A no_response session is likely asleep; skip the post-monitor roundtrips.
+    if no_monitor or kind: return rr
     if not reloaded:
         try: rr['transients'] = get_temp_texts(driver, timeout=MONITOR_TIMEOUT)
         except: rr['transients'] = []

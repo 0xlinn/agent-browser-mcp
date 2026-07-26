@@ -23,8 +23,14 @@ from . import simphtml  # noqa: E402
 mcp = FastMCP(
     name="agent-browser",
     instructions=(
-        "Browser automation tools for the user's real Chrome session via TMWebDriver/CDP bridge. "
-        "Supports page scanning, JS execution, CDP commands, screenshots, cookies, and desktop physical input."
+        "Browser automation tools for the user's real Chrome/Edge session via TMWebDriver/CDP bridge. "
+        "Supports page scanning, JS execution, CDP commands, screenshots, cookies, and desktop physical input. "
+        "Several browsers can be connected at once; list_tabs shows a browser field per tab. "
+        "Before acting, pick the target explicitly with switch_tab(browser='chrome'|'edge') or a full "
+        "session_id (a 'client:tabId' string - pass it verbatim, never split it). "
+        "If a result carries status='no_response', switched_session, or bridge_error: the tab slept, "
+        "reconnected, or the bridge blipped - run list_tabs, switch_tab to the right target, then retry; "
+        "re-run scripts with side effects only after scan_page confirms they did not land."
     ),
 )
 
@@ -193,6 +199,13 @@ def switch_session(
     if driver.default_session_id:
         return str(driver.default_session_id)
     sessions = ensure_sessions()
+    # With several browsers connected, a blind default should land on the
+    # user-preferred one (AGENT_BROWSER_PREFERRED_BROWSER=chrome|edge|opera).
+    pref = os.environ.get("AGENT_BROWSER_PREFERRED_BROWSER", "").strip().lower()
+    if pref:
+        preferred = [s for s in sessions if str(s.get("browser", "")).lower() == pref]
+        if preferred:
+            sessions = preferred
     driver.default_session_id = str(sessions[0]["id"])
     return str(driver.default_session_id)
 
@@ -201,7 +214,19 @@ def exec_js(script: str, session_id: Optional[str] = None, timeout: float = 15.0
     driver = require_driver()
     if session_id is not None:
         driver.default_session_id = str(session_id)
-    return driver.execute_js(script, timeout=timeout)
+    response = driver.execute_js(script, timeout=timeout)
+    if simphtml.no_response_kind(response) == "undelivered":
+        # Never reached the page; retrying is side-effect-free.
+        response = driver.execute_js(script, timeout=timeout)
+    kind = simphtml.no_response_kind(response)
+    if kind:
+        # Tools built on this helper (CDP, cookies, screenshots) have nothing
+        # useful to return without data; fail loudly instead of returning junk.
+        raise RuntimeError(
+            f"Bridge no-response ({kind}): {response.get('result')}. "
+            "Session may be asleep or disconnected; run list_tabs, switch_tab to a live session, then retry."
+        )
+    return response
 
 
 def compact_tabs(timeout: Optional[float] = None, fresh: bool = False) -> list[dict[str, Any]]:
@@ -250,7 +275,7 @@ def get_setup_status() -> dict[str, Any]:
     return status
 
 
-@mcp.tool(description="List currently connected browser tabs/sessions.")
+@mcp.tool(description="List connected tabs across all connected browsers; each tab has a browser field (chrome/edge/opera) and a session id to pass verbatim.")
 def list_tabs() -> dict[str, Any]:
     try:
         sessions = compact_tabs(timeout=_STATUS_TIMEOUT, fresh=True)

@@ -216,19 +216,28 @@ class TMWebDriver:
             if response.get('error'): raise Exception(response['error'])
             return response
  
+        switched_from = None
         session = self.sessions.get(session_id)
-        if not session or not session.is_active(): 
+        if not session or not session.is_active():
             time.sleep(3)
             session = self.sessions.get(session_id)
-            if not session or not session.is_active(): 
+            if not session or not session.is_active():
                 alive_sessions = [s for s in self.sessions.values() if s.is_active()]
                 if alive_sessions:
+                    # Failover must not silently jump browsers: prefer a tab from
+                    # the same client namespace (client_id:tab_id) as the dead one.
+                    want_client = str(session_id).rsplit(':', 1)[0] if session_id and ':' in str(session_id) else None
+                    same_client = [s for s in alive_sessions if want_client and str(s.id).startswith(want_client + ':')]
+                    pool = same_client or alive_sessions
                     latest = self.sessions.get(self.latest_session_id)
-                    session = latest if latest in alive_sessions else alive_sessions[-1]
-                    print(f"会话 {session_id} 未连接，自动切换到最新活动会话: {session.id}")
+                    session = latest if latest in pool else pool[-1]
+                    print(f"会话 {session_id} 未连接，自动切换到活动会话: {session.id}")
+                    switched_from = session_id
                     session_id = self.default_session_id = session.id
-                if not session or not session.is_active(): 
-                    raise ValueError(f"会话ID {session_id} 未连接")  
+                if not session or not session.is_active():
+                    raise ValueError(f"会话ID {session_id} 未连接")
+        # Callers (and the AI driving them) must learn their target changed.
+        extra = {'switched_session': session_id, 'switched_from': switched_from} if switched_from else {}
 
         tp = session.type
         assert tp in ['ws', 'http', 'ext_ws'], f"Unsupported session type: {tp}"
@@ -259,20 +268,20 @@ class TMWebDriver:
             if tp in ['ws', 'ext_ws']:
                 if not session.is_active(): hasjump = True
                 if hasjump and session.is_active():
-                    return {'result': f"Session {session_id} reloaded.", "closed":1}
-            if time.time() - start_time > timeout:  
+                    return {'result': f"Session {session_id} reloaded.", "closed":1, **extra}
+            if time.time() - start_time > timeout:
                 if tp in ['ws', 'ext_ws']:
-                    if hasjump: return {'result': f"Session {session_id} reloaded and new page is loading...", 'closed':1}
-                    if acked: return {"result": f"No response data in {timeout}s (ACK received, script may still be running)"}
-                    return {"result": f"No response data in {timeout}s (no ACK, script may not have been delivered)"}
+                    if hasjump: return {'result': f"Session {session_id} reloaded and new page is loading...", 'closed':1, **extra}
+                    if acked: return {"result": f"No response data in {timeout}s (ACK received, script may still be running)", **extra}
+                    return {"result": f"No response data in {timeout}s (no ACK, script may not have been delivered)", **extra}
                 elif tp == 'http':
-                    if acked: return {"result": f"Session {session_id} no response in {timeout}s (delivered but no result)"}
-                    return {"result": f"Session {session_id} no response in {timeout}s (script not polled)"}
+                    if acked: return {"result": f"Session {session_id} no response in {timeout}s (delivered but no result)", **extra}
+                    return {"result": f"Session {session_id} no response in {timeout}s (script not polled)", **extra}
         
         result = self.results.pop(exec_id)  
         if exec_id in self.acks: self.acks.pop(exec_id)
         if not result['success']: raise Exception(result['data'])  
-        rr = {'data': result['data']}
+        rr = {'data': result['data'], **extra}
         newtabs = result.get('newTabs', []); [x.pop('ts', None) for x in newtabs]
         if newtabs: rr['newTabs'] = newtabs
         return rr
