@@ -70,7 +70,7 @@ class TMWebDriver:
             while time.time() - start_time < 5:
                 try:
                     msg = msgQ.get(timeout=0.2)
-                    try: self.acks[json.loads(msg).get('id','')] = True
+                    try: self.acks[json.loads(msg).get('id','')] = time.time()
                     except: traceback.print_exc()
                     return msg
                 except queue.Empty: continue
@@ -79,10 +79,10 @@ class TMWebDriver:
         @app.route('/api/result', method=['GET','POST'])
         def result():
             data = request.json
-            if data.get('type') == 'result':  
-                self.results[data.get('id')] = {'success': True, 'data': data.get('result'), 'newTabs': data.get('newTabs', [])}  
-            elif data.get('type') == 'error':  
-                self.results[data.get('id')] = {'success': False, 'data': data.get('error'), 'newTabs': data.get('newTabs', [])}  
+            if data.get('type') == 'result':
+                self.results[data.get('id')] = {'success': True, 'data': data.get('result'), 'newTabs': data.get('newTabs', []), 'ts': time.time()}
+            elif data.get('type') == 'error':
+                self.results[data.get('id')] = {'success': False, 'data': data.get('error'), 'newTabs': data.get('newTabs', []), 'ts': time.time()}
             return 'ok'
 
         @app.route('/link', method=['GET','POST'])
@@ -114,11 +114,21 @@ class TMWebDriver:
         http_thread.start()  
 
     def clean_sessions(self):
-        sids = list(self.sessions.keys())
-        for sid in sids:
+        now = time.time()
+        for sid in list(self.sessions.keys()):
             session = self.sessions[sid]
-            if not session.is_active() and time.time() - session.disconnect_at > 600:
+            if not session.is_active() and now - session.disconnect_at > 600:
                 del self.sessions[sid]
+        # Results/acks that arrive after their caller already timed out would
+        # otherwise accumulate forever in a long-lived daemon.
+        for r_id in list(self.results.keys()):
+            entry = self.results.get(r_id)
+            if isinstance(entry, dict) and now - entry.get('ts', now) > 600:
+                self.results.pop(r_id, None)
+        for a_id in list(self.acks.keys()):
+            ts = self.acks.get(a_id)
+            if not isinstance(ts, float) or now - ts > 600:
+                self.acks.pop(a_id, None)
     
     def start_ws_server(self) -> None:  
         driver = self  
@@ -156,11 +166,11 @@ class TMWebDriver:
                             sess = driver.sessions.get(session_id)
                             if sess and sess.is_active(): sess.info = session_info
                             else: driver._register_client(session_id, self, session_info)
-                    elif data.get('type') == 'ack': driver.acks[data.get('id','')] = True
-                    elif data.get('type') == 'result':  
-                        driver.results[data.get('id')] = {'success': True, 'data': data.get('result'), 'newTabs': data.get('newTabs', [])}  
-                    elif data.get('type') == 'error':  
-                        driver.results[data.get('id')] = {'success': False, 'data': data.get('error'), 'newTabs': data.get('newTabs', [])}  
+                    elif data.get('type') == 'ack': driver.acks[data.get('id','')] = time.time()
+                    elif data.get('type') == 'result':
+                        driver.results[data.get('id')] = {'success': True, 'data': data.get('result'), 'newTabs': data.get('newTabs', []), 'ts': time.time()}
+                    elif data.get('type') == 'error':
+                        driver.results[data.get('id')] = {'success': False, 'data': data.get('error'), 'newTabs': data.get('newTabs', []), 'ts': time.time()}
                 except Exception as e:  
                     print(f"Error handling message: {e}")  
                     if hasattr(self, 'data'): print(self.data)  
@@ -213,7 +223,8 @@ class TMWebDriver:
             if not session or not session.is_active(): 
                 alive_sessions = [s for s in self.sessions.values() if s.is_active()]
                 if alive_sessions:
-                    session = alive_sessions[0]  
+                    latest = self.sessions.get(self.latest_session_id)
+                    session = latest if latest in alive_sessions else alive_sessions[-1]
                     print(f"会话 {session_id} 未连接，自动切换到最新活动会话: {session.id}")
                     session_id = self.default_session_id = session.id
                 if not session or not session.is_active(): 
@@ -228,7 +239,13 @@ class TMWebDriver:
             payload_dict['tabId'] = int(session.info.get('tab_id', str(session.id).rsplit(':', 1)[-1]))
         payload = json.dumps(payload_dict)
 
-        if tp in ['ws', 'ext_ws']: session.ws_client.send_message(payload)  
+        if tp in ['ws', 'ext_ws']:
+            try: session.ws_client.send_message(payload)
+            except Exception as e:
+                # Half-open socket (e.g. after system sleep): mark it dead so
+                # the next call fails over instead of hitting it again.
+                session.mark_disconnected()
+                raise ValueError(f"会话 {session_id} 连接已失效({e})，已标记断开，请重试")
         elif tp == 'http': session.http_queue.put(payload)
 
         start_time = time.time()  
@@ -274,9 +291,9 @@ class TMWebDriver:
         return {session['id']: session['url'] for session in self.get_all_sessions(timeout=timeout)}
         
     def find_session(self, url_pattern: str):
-        if url_pattern == '': 
+        if url_pattern == '':
             session = self.sessions.get(self.latest_session_id)
-            return [(session.id, session.info)] if session else []
+            return [(session.id, session.info)] if session and session.is_active() else []
         matching_sessions = []  
         for session in self.sessions.values():
             if not session.is_active(): continue
@@ -295,10 +312,10 @@ class TMWebDriver:
         print(f"成功设置默认会话: {self.default_session_id}: {info['url']}")  
         return self.default_session_id  
     
-    def jump(self, url, timeout=10): self.execute_js(f"window.location.href='{url}'", timeout=timeout)
+    def jump(self, url, timeout=10): self.execute_js(f"window.location.href={json.dumps(url)}", timeout=timeout)
     def newtab(self, url=None):
         if url is None: url = "http://www.baidu.com/robots.txt"
-        return self.execute_js(f'GM_openInTab("{url}");')
+        return self.execute_js(f'GM_openInTab({json.dumps(url)});')
     
 if __name__ == "__main__":
     driver = TMWebDriver(host='127.0.0.1', port=18765)

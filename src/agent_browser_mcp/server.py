@@ -397,12 +397,13 @@ def get_cookies(session_id: Optional[str] = None, tab_id: Optional[int] = None) 
     return exec_js(json.dumps(payload), timeout=15.0)
 
 
-@mcp.tool(description="Capture a screenshot of the current page/tab via CDP and optionally save it to a file path.")
+@mcp.tool(description="Capture a screenshot of the current page/tab via CDP. Prefer save_path (then view the file); base64 is returned only without save_path or with return_base64=true.")
 def capture_page_screenshot(
     session_id: Optional[str] = None,
     tab_id: Optional[int] = None,
     format: str = "png",
     save_path: str = "",
+    return_base64: bool = False,
 ) -> dict[str, Any]:
     if session_id is not None:
         switch_session(session_id=session_id)
@@ -419,13 +420,28 @@ def capture_page_screenshot(
         b64 = data["data"]
     else:
         b64 = data
-    out: dict[str, Any] = {"format": format, "base64": b64}
+    out: dict[str, Any] = {"format": format}
     if save_path:
+        raw = base64.b64decode(b64)
         path = Path(save_path).expanduser().resolve()
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(base64.b64decode(b64))
+        path.write_bytes(raw)
         out["saved_to"] = str(path)
+        out["size"] = len(raw)
+        if return_base64:
+            out["base64"] = b64
+    else:
+        out["base64"] = b64
     return out
+
+
+def _pyautogui():
+    # pyautogui reads no env vars; the failsafe (corner abort raising
+    # FailSafeException mid-automation) must be disabled on the module itself.
+    import pyautogui
+
+    pyautogui.FAILSAFE = False
+    return pyautogui
 
 
 @mcp.tool(description="Take a desktop screenshot of the whole screen using mss; useful for physical-input verification.")
@@ -445,7 +461,7 @@ def capture_desktop_screenshot(save_path: str = "") -> dict[str, Any]:
 
 @mcp.tool(description="Move the real mouse cursor to screen coordinates.")
 def mouse_move(x: int, y: int, duration: float = 0.0) -> dict[str, Any]:
-    import pyautogui
+    pyautogui = _pyautogui()
 
     pyautogui.moveTo(x, y, duration=duration)
     return {"status": "ok", "x": x, "y": y}
@@ -459,7 +475,7 @@ def mouse_click(
     clicks: int = 1,
     interval: float = 0.1,
 ) -> dict[str, Any]:
-    import pyautogui
+    pyautogui = _pyautogui()
 
     if x is not None and y is not None:
         pyautogui.click(x=x, y=y, clicks=clicks, interval=interval, button=button)
@@ -470,7 +486,7 @@ def mouse_click(
 
 @mcp.tool(description="Drag the real mouse from one point to another.")
 def mouse_drag(x1: int, y1: int, x2: int, y2: int, duration: float = 0.3, button: str = "left") -> dict[str, Any]:
-    import pyautogui
+    pyautogui = _pyautogui()
 
     pyautogui.moveTo(x1, y1)
     pyautogui.dragTo(x2, y2, duration=duration, button=button)
@@ -479,7 +495,7 @@ def mouse_drag(x1: int, y1: int, x2: int, y2: int, duration: float = 0.3, button
 
 @mcp.tool(description="Type text via the real keyboard, optionally after clicking a field.")
 def type_text(text: str, interval: float = 0.01, click_x: Optional[int] = None, click_y: Optional[int] = None) -> dict[str, Any]:
-    import pyautogui
+    pyautogui = _pyautogui()
 
     if click_x is not None and click_y is not None:
         pyautogui.click(click_x, click_y)
@@ -490,7 +506,7 @@ def type_text(text: str, interval: float = 0.01, click_x: Optional[int] = None, 
 
 @mcp.tool(description="Send a hotkey chord like 'command,l' or 'ctrl,shift,p' via the real keyboard.")
 def hotkey(keys_csv: str) -> dict[str, Any]:
-    import pyautogui
+    pyautogui = _pyautogui()
 
     keys = [k.strip() for k in keys_csv.split(",") if k.strip()]
     if not keys:
@@ -501,7 +517,7 @@ def hotkey(keys_csv: str) -> dict[str, Any]:
 
 @mcp.tool(description="Report the current desktop mouse position and primary screen size.")
 def pointer_info() -> dict[str, Any]:
-    import pyautogui
+    pyautogui = _pyautogui()
 
     x, y = pyautogui.position()
     w, h = pyautogui.size()
