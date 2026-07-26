@@ -80,7 +80,15 @@ def spawn_bridge_daemon() -> bool:
     """
     # -u: unbuffered, so daemon tracebacks reach bridge.log immediately
     # instead of dying in a block buffer that never flushes.
-    cmd = [sys.executable, "-u", "-m", "agent_browser_mcp.bridge"]
+    # Prefer pythonw.exe on Windows: it's the GUI-subsystem interpreter with no
+    # console window at the binary level, so a stray console never flashes even
+    # if the CREATE_NO_WINDOW flag is ignored under some launch environments.
+    exe = sys.executable
+    if sys.platform == "win32":
+        cand = Path(exe).with_name("pythonw.exe")
+        if cand.exists():
+            exe = str(cand)
+    cmd = [exe, "-u", "-m", "agent_browser_mcp.bridge"]
     kwargs: dict[str, Any] = {
         "stdin": subprocess.DEVNULL,
         "close_fds": True,
