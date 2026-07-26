@@ -78,6 +78,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("extension-path", help="Print the unpacked Chrome extension path")
     sub.add_parser("doctor", help="Run local diagnostics and print JSON status")
     sub.add_parser("print-hermes-config", help="Print a ready-to-paste Hermes MCP config snippet")
+    sub.add_parser("bridge", help="Run the TMWebDriver bridge daemon in the foreground")
     return parser
 
 
@@ -91,6 +92,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_doctor()
     if args.command == "print-hermes-config":
         return cmd_print_hermes_config()
+    if args.command == "bridge":
+        from .bridge import main as bridge_main
+
+        return bridge_main()
 
     ensure_config_js()
     get_driver()

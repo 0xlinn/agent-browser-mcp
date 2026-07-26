@@ -4,12 +4,12 @@ import base64
 import json
 import os
 import random
+import socket
+import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Any, Optional
-
-os.environ.setdefault("PYAUTO_GUI_NO_FAILSAFE", "1")
 
 from mcp.server.fastmcp import FastMCP
 
@@ -47,10 +47,70 @@ def ensure_config_js() -> Path:
     return path
 
 
+def _port_open(host: str, port: int) -> bool:
+    with socket.socket() as sock:
+        sock.settimeout(1)
+        return sock.connect_ex((host, port)) == 0
+
+
+def _bridge_log_path() -> Path:
+    log_dir = Path.home() / ".agent-browser-mcp"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    path = log_dir / "bridge.log"
+    try:
+        if path.exists() and path.stat().st_size > 5 * 1024 * 1024:
+            path.replace(path.with_suffix(".log.old"))
+    except OSError:
+        pass
+    return path
+
+
+def spawn_bridge_daemon() -> bool:
+    """Start the bridge as a detached process so it outlives this MCP instance.
+
+    Returns True once the bridge HTTP port answers. Self-hosting from an MCP
+    instance is avoided because these instances are spawned per session and
+    recycled, taking the bridge (and its bound ports) down with them.
+    """
+    cmd = [sys.executable, "-m", "agent_browser_mcp.bridge"]
+    kwargs: dict[str, Any] = {
+        "stdin": subprocess.DEVNULL,
+        "close_fds": True,
+        "cwd": str(Path.home()),
+    }
+    if sys.platform == "win32":
+        DETACHED_PROCESS = 0x00000008
+        CREATE_NEW_PROCESS_GROUP = 0x00000200
+        CREATE_NO_WINDOW = 0x08000000
+        kwargs["creationflags"] = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+    else:
+        kwargs["start_new_session"] = True
+    try:
+        with open(_bridge_log_path(), "ab") as log:
+            kwargs["stdout"] = log
+            kwargs["stderr"] = log
+            subprocess.Popen(cmd, **kwargs)
+    except OSError:
+        return False
+    deadline = time.monotonic() + 8
+    while time.monotonic() < deadline:
+        if _port_open(_DRIVER_HOST, _DRIVER_PORT + 1):
+            return True
+        time.sleep(0.25)
+    return False
+
+
 def get_driver() -> TMWebDriver:
     global _driver
     ensure_config_js()
     if _driver is None:
+        if (
+            os.environ.get("AGENT_BROWSER_NO_SPAWN") != "1"
+            and not _port_open(_DRIVER_HOST, _DRIVER_PORT + 1)
+        ):
+            spawn_bridge_daemon()
+        # If the spawn failed the constructor falls back to self-hosting,
+        # which keeps the original single-process behavior working.
         _driver = TMWebDriver(host=_DRIVER_HOST, port=_DRIVER_PORT)
     return _driver
 
@@ -60,8 +120,8 @@ def require_driver() -> TMWebDriver:
     return driver
 
 
-def active_sessions() -> list[dict[str, Any]]:
-    return require_driver().get_all_sessions()
+def active_sessions(timeout: Optional[float] = None) -> list[dict[str, Any]]:
+    return require_driver().get_all_sessions(timeout=timeout)
 
 
 def ensure_sessions() -> list[dict[str, Any]]:
@@ -127,9 +187,9 @@ def exec_js(script: str, session_id: Optional[str] = None, timeout: float = 15.0
     return driver.execute_js(script, timeout=timeout)
 
 
-def compact_tabs() -> list[dict[str, Any]]:
+def compact_tabs(timeout: Optional[float] = None) -> list[dict[str, Any]]:
     tabs = []
-    for sess in active_sessions():
+    for sess in active_sessions(timeout=timeout):
         item = dict(sess)
         item.pop("connected_at", None)
         item.pop("type", None)
@@ -137,11 +197,21 @@ def compact_tabs() -> list[dict[str, Any]]:
     return tabs
 
 
+# Status/diagnostic tools must answer fast even when the bridge is half-dead;
+# they use this short timeout and degrade instead of raising.
+_STATUS_TIMEOUT = 5.0
+
+
 @mcp.tool(description="Return extension path, bridge ports, and connection status for setup/diagnostics.")
 def get_setup_status() -> dict[str, Any]:
     driver = get_driver()
-    sessions = compact_tabs()
-    return {
+    bridge_error = None
+    try:
+        sessions = compact_tabs(timeout=_STATUS_TIMEOUT)
+    except Exception as e:
+        sessions = []
+        bridge_error = str(e)
+    status: dict[str, Any] = {
         "extension_name": "TMWD CDP Bridge",
         "extension_path": str(chrome_extension_dir()),
         "config_js": str(ensure_config_js()),
@@ -155,14 +225,24 @@ def get_setup_status() -> dict[str, Any]:
         "notes": [
             "Load the unpacked extension from extension_path in chrome://extensions with Developer Mode enabled.",
             "Keep a normal http/https page open in Chrome; about:blank is not enough.",
-            "This MCP server hosts TMWebDriver itself unless another compatible bridge is already listening.",
+            "The bridge runs as a detached daemon; this MCP server auto-starts it when missing.",
         ],
     }
+    if bridge_error:
+        status["bridge_error"] = bridge_error
+    return status
 
 
 @mcp.tool(description="List currently connected browser tabs/sessions.")
 def list_tabs() -> dict[str, Any]:
-    sessions = compact_tabs()
+    try:
+        sessions = compact_tabs(timeout=_STATUS_TIMEOUT)
+    except Exception as e:
+        return {
+            "default_session_id": require_driver().default_session_id,
+            "tabs": [],
+            "bridge_error": str(e),
+        }
     return {
         "default_session_id": require_driver().default_session_id,
         "tabs": sessions,

@@ -40,7 +40,9 @@ class TMWebDriver:
         self.sessions, self.results, self.acks = {}, {}, {}
         self.default_session_id = None  
         self.latest_session_id = None  
-        self.is_remote = socket.socket().connect_ex((host, port+1)) == 0
+        with socket.socket() as _probe:
+            _probe.settimeout(1)
+            self.is_remote = _probe.connect_ex((host, port+1)) == 0
         if not self.is_remote:  
             self.start_ws_server()  
             self.start_http_server()
@@ -196,8 +198,11 @@ class TMWebDriver:
         if session_id is None: session_id = self.default_session_id  
         if self.is_remote:
             print('remote_execute_js')
-            response = self._remote_cmd({"cmd": "execute_js", "sessionId": session_id, 
-                                         "code": code, "timeout": str(timeout)}).get('r', {})
+            # HTTP timeout must outlast the JS timeout or long scripts die at
+            # the transport layer before the bridge can answer.
+            response = self._remote_cmd({"cmd": "execute_js", "sessionId": session_id,
+                                         "code": code, "timeout": str(timeout)},
+                                        timeout=float(timeout) + 10).get('r', {})
             if response.get('error'): raise Exception(response['error'])
             return response
  
@@ -258,14 +263,15 @@ class TMWebDriver:
     def _remote_cmd(self, cmd, timeout=30):
         return requests.post(self.remote, headers={"Content-Type": "application/json"}, json=cmd, timeout=timeout).json()
 
-    def get_all_sessions(self):  
+    def get_all_sessions(self, timeout=None):
         if self.is_remote:
-            return self._remote_cmd({"cmd": "get_all_sessions"}).get('r', [])
+            return self._remote_cmd({"cmd": "get_all_sessions"}, timeout=timeout or 30).get('r', [])
+        self.clean_sessions()
         return [{'id': session.id, **session.info} for session in self.sessions.values()
-                if session.is_active()]  
+                if session.is_active()]
 
-    def get_session_dict(self):
-        return {session['id']: session['url'] for session in self.get_all_sessions()}
+    def get_session_dict(self, timeout=None):
+        return {session['id']: session['url'] for session in self.get_all_sessions(timeout=timeout)}
         
     def find_session(self, url_pattern: str):
         if url_pattern == '': 
