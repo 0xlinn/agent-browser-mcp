@@ -169,7 +169,18 @@ class TMWebDriver:
             ts = self.acks.get(a_id)
             if not isinstance(ts, float) or now - ts > 600:
                 self.acks.pop(a_id, None)
-    
+        # Per-client heartbeat stamps leak otherwise: client_id is random per
+        # extension install/profile, so every reinstall adds a new key that
+        # never goes away. Drop stamps for clients with no active session and
+        # no heartbeat in 10 min.
+        live_clients = {s.info.get('client_id') for s in self.sessions.values()
+                        if s.is_active() and s.info.get('client_id')}
+        for cid in list(self.client_last_seen.keys()):
+            entry = self.client_last_seen.get(cid)
+            if cid not in live_clients and (not isinstance(entry, dict)
+                    or now - entry.get('ts', now) > 600):
+                self.client_last_seen.pop(cid, None)
+
     def start_ws_server(self) -> None:  
         driver = self  
         class JSExecutor(WebSocket):  
@@ -395,8 +406,8 @@ class TMWebDriver:
                         "advice": "桥守护无响应/端口拒绝 → 通常自动拉起；否则手动跑 python -m agent_browser_mcp.bridge (SKILL 成因1)",
                         "error": str(e)}
         self.clean_sessions()
-        active = [s for s in self.sessions.values() if s.is_active()]
         now = time.time()
+        active = [s for s in self.sessions.values() if s.is_active()]
         ever = self.last_ext_seen is not None
         stale = ever and (now - self.last_ext_seen) > 90
         per_client = {cid: {"browser": v.get("browser", ""), "seconds_ago": round(now - v["ts"], 1)}
@@ -409,8 +420,8 @@ class TMWebDriver:
                 "② 扩展是否被禁用(2b) ③ 是否没开任何 http(s) 页面。")
         elif stale:
             cause, ok, advice = "sw_slept_or_dropped", False, (
-                f"扩展曾注册但已 {round(now - self.last_ext_seen)}s 无心跳：多半 SW 睡死(成因2d)。"
-                "开着的正常网页应在 5s 内自愈；否则 chrome://extensions 点 ↻ reload。")
+                f"扩展曾注册但已 {round(now - self.last_ext_seen)}s 无心跳：SW 睡死(2d)或半开僵尸(2c)，"
+                "两者修复动作相同——开着的正常网页应 5s 内自愈；否则 chrome://extensions 点 ↻ reload。")
         else:
             cause, ok, advice = "registering", False, (
                 "扩展刚有心跳但当前 0 活跃 tab：正在注册/所有 tab 都是 chrome:// 或空白页，稍等或打开一个 http(s) 页面。")
