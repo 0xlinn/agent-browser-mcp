@@ -630,11 +630,11 @@ temp_monitor_js = """function startStrMonitor(interval) {
     }  
     startStrMonitor(450);  
 """  
-def start_temp_monitor(driver):  
-    try: driver.execute_js(temp_monitor_js)
+def start_temp_monitor(driver, timeout=15):
+    try: driver.execute_js(temp_monitor_js, timeout=timeout)
     except: pass
 
-def get_temp_texts(driver):  
+def get_temp_texts(driver, timeout=15):
     js = """function stopStrMonitor() {  
         if (!window._tm) return [];  
         clearInterval(window._tm.id);  
@@ -651,14 +651,14 @@ def get_temp_texts(driver):
         }  
         stopStrMonitor();  
     """  
-    try: return list(set(driver.execute_js(js).get('data', [])))
-    except Exception as e: 
+    try: return list(set(driver.execute_js(js, timeout=timeout).get('data', [])))
+    except Exception as e:
         print(e)
         return []
     
 import time, re, os
-def get_main_block(driver, extra_js="", text_only=False): 
-    page = driver.execute_js(f"{extra_js}\n{js_optHTML}\nreturn optHTML({str(text_only).lower()});").get('data', '')
+def get_main_block(driver, extra_js="", text_only=False, timeout=15):
+    page = driver.execute_js(f"{extra_js}\n{js_optHTML}\nreturn optHTML({str(text_only).lower()});", timeout=timeout).get('data', '')
     if text_only:
         page = re.sub(r' {2,}', ' ', page)           # 连续空格→单空格
         page = re.sub(r'^ +', '', page, flags=re.M)   # 去行首空格
@@ -699,9 +699,12 @@ def find_changed_elements(before_html, after_html):
         result["top_change"] = h if len(h) <= 2000 else h[:2000] + '...[TRUNCATED]'
     return result
 
-def get_html(driver, cutlist=False, maxchars=35000, instruction="", extra_js="", text_only=False):
-    if cutlist: rr = driver.execute_js(js_findMainList + "return findMainList(document.body);").get('data', [])
-    page = get_main_block(driver, extra_js=extra_js, text_only=text_only)
+def get_html(driver, cutlist=False, maxchars=35000, instruction="", extra_js="", text_only=False, timeout=15):
+    if cutlist: rr = driver.execute_js(js_findMainList + "return findMainList(document.body);", timeout=timeout).get('data', [])
+    page = get_main_block(driver, extra_js=extra_js, text_only=text_only, timeout=timeout)
+    # Hard cap before parsing: BeautifulSoup on a multi-MB page dominates the
+    # call's latency, and callers only ever see maxchars of it anyway.
+    if isinstance(page, str) and len(page) > 1_500_000: page = page[:1_500_000]
     if text_only: return page
     soup = optimize_html_for_tokens(page)
     for div in soup.select('div[data-tag="iframe"]'):
@@ -814,19 +817,30 @@ def smart_truncate(soup, budget, _depth=0):
         else: cut(c, new_keep)
     return soup
 
-def execute_js_rich(script, driver, no_monitor=False):
+# The monitor snapshots/diff around execute_js are best-effort context, not the
+# result itself; keep them on short timeouts and bounded sizes so a slow or
+# hostile page can't multiply the tool call's latency (formerly up to 6 bridge
+# roundtrips x 30s each).
+MONITOR_TIMEOUT = 6
+MONITOR_MAXCHARS = 300000
+
+def execute_js_rich(script, driver, no_monitor=False, timeout=15, before_sids=None):
     last_html = None
     if not no_monitor:
-        try: last_html = get_html(driver, cutlist=False, extra_js=temp_monitor_js, maxchars=9999999)
+        try: last_html = get_html(driver, cutlist=False, extra_js=temp_monitor_js,
+                                  maxchars=MONITOR_MAXCHARS, timeout=MONITOR_TIMEOUT)
         except: pass
     result = None;  error_msg = None;  reloaded = False; newTabs = []
-    before_sids = set(driver.get_session_dict().keys()); response = {}
+    if before_sids is None:
+        try: before_sids = set(driver.get_session_dict(timeout=MONITOR_TIMEOUT).keys())
+        except: before_sids = set()
+    response = {}
     try:
         print(f"Executing: {script[:250]} ...")
-        response = driver.execute_js(script)
+        response = driver.execute_js(script, timeout=timeout)
         result = response['data'] if 'data' in response else response.get('result')
         if response.get('closed', 0) == 1: reloaded = True
-        time.sleep(1) 
+        time.sleep(1)
     except Exception as e:
         error = e.args[0] if e.args else str(e)
         if isinstance(error, dict): error.pop('stack', None)
@@ -836,12 +850,14 @@ def execute_js_rich(script, driver, no_monitor=False):
         "status": "failed" if error_msg else "success",
         "js_return": result,
         "tab_id": driver.default_session_id
-    }  
+    }
     if reloaded: rr['reloaded'] = reloaded
     if response.get('newTabs'): rr['newTabs'] = response['newTabs']
-    else:
-        after = driver.get_session_dict()
-        new_sids = {k: v for k, v in after.items() if k not in before_sids}
+    elif not error_msg:
+        try:
+            after = driver.get_session_dict(timeout=MONITOR_TIMEOUT)
+            new_sids = {k: v for k, v in after.items() if k not in before_sids}
+        except: new_sids = {}
         if new_sids:
             newTabs = [{'id': k, 'url': v} for k, v in new_sids.items()]
             rr['newTabs'] = newTabs
@@ -849,11 +865,12 @@ def execute_js_rich(script, driver, no_monitor=False):
     if error_msg: rr['error'] = error_msg
     if no_monitor: return rr
     if not reloaded:
-        try: rr['transients'] = get_temp_texts(driver)
+        try: rr['transients'] = get_temp_texts(driver, timeout=MONITOR_TIMEOUT)
         except: rr['transients'] = []
-    if not reloaded and len(newTabs) == 0:
+    if not reloaded and not error_msg and len(newTabs) == 0:
         try:
-            current_html = get_html(driver, cutlist=False, maxchars=9999999)
+            current_html = get_html(driver, cutlist=False, maxchars=MONITOR_MAXCHARS,
+                                    timeout=MONITOR_TIMEOUT)
             if last_html is None: raise Exception("no baseline")
             diff_data = find_changed_elements(last_html, current_html)
             change_count = diff_data.get('changed', 0)

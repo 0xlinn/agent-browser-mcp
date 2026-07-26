@@ -120,8 +120,25 @@ def require_driver() -> TMWebDriver:
     return driver
 
 
-def active_sessions(timeout: Optional[float] = None) -> list[dict[str, Any]]:
-    return require_driver().get_all_sessions(timeout=timeout)
+# In remote mode every session listing is an HTTP roundtrip to the bridge; a
+# single tool call may want it several times (precheck, response tabs, newTab
+# detection). A tiny TTL cache collapses those into one roundtrip.
+_sessions_cache: Optional[tuple[float, list[dict[str, Any]]]] = None
+_SESSIONS_TTL = 2.0
+
+
+def invalidate_sessions_cache() -> None:
+    global _sessions_cache
+    _sessions_cache = None
+
+
+def active_sessions(timeout: Optional[float] = None, fresh: bool = False) -> list[dict[str, Any]]:
+    global _sessions_cache
+    if not fresh and _sessions_cache and time.monotonic() - _sessions_cache[0] < _SESSIONS_TTL:
+        return _sessions_cache[1]
+    sessions = require_driver().get_all_sessions(timeout=timeout)
+    _sessions_cache = (time.monotonic(), sessions)
+    return sessions
 
 
 def ensure_sessions() -> list[dict[str, Any]]:
@@ -187,9 +204,9 @@ def exec_js(script: str, session_id: Optional[str] = None, timeout: float = 15.0
     return driver.execute_js(script, timeout=timeout)
 
 
-def compact_tabs(timeout: Optional[float] = None) -> list[dict[str, Any]]:
+def compact_tabs(timeout: Optional[float] = None, fresh: bool = False) -> list[dict[str, Any]]:
     tabs = []
-    for sess in active_sessions(timeout=timeout):
+    for sess in active_sessions(timeout=timeout, fresh=fresh):
         item = dict(sess)
         item.pop("connected_at", None)
         item.pop("type", None)
@@ -207,7 +224,7 @@ def get_setup_status() -> dict[str, Any]:
     driver = get_driver()
     bridge_error = None
     try:
-        sessions = compact_tabs(timeout=_STATUS_TIMEOUT)
+        sessions = compact_tabs(timeout=_STATUS_TIMEOUT, fresh=True)
     except Exception as e:
         sessions = []
         bridge_error = str(e)
@@ -236,7 +253,7 @@ def get_setup_status() -> dict[str, Any]:
 @mcp.tool(description="List currently connected browser tabs/sessions.")
 def list_tabs() -> dict[str, Any]:
     try:
-        sessions = compact_tabs(timeout=_STATUS_TIMEOUT)
+        sessions = compact_tabs(timeout=_STATUS_TIMEOUT, fresh=True)
     except Exception as e:
         return {
             "default_session_id": require_driver().default_session_id,
@@ -265,6 +282,7 @@ def open_url(url: str, session_id: Optional[str] = None, timeout: float = 15.0) 
         switch_session(session_id=session_id)
     driver = require_driver()
     driver.jump(url, timeout=timeout)
+    invalidate_sessions_cache()
     return {
         "status": "ok",
         "active_session_id": driver.default_session_id,
@@ -276,6 +294,7 @@ def open_url(url: str, session_id: Optional[str] = None, timeout: float = 15.0) 
 def open_new_tab(url: str) -> dict[str, Any]:
     driver = require_driver()
     result = driver.newtab(url)
+    invalidate_sessions_cache()
     return {"status": "ok", "result": result, "tabs": compact_tabs()}
 
 
@@ -302,6 +321,7 @@ def scan_page(
     maxchars: int = 35000,
     instruction: str = "",
     extra_js: str = "",
+    timeout: float = 15.0,
 ) -> dict[str, Any]:
     driver = require_driver()
     if session_id is not None:
@@ -314,6 +334,7 @@ def scan_page(
         instruction=instruction,
         extra_js=extra_js,
         text_only=text_only,
+        timeout=timeout,
     )
     return {
         "status": "success",
@@ -328,12 +349,16 @@ def execute_js(
     script: str,
     session_id: Optional[str] = None,
     no_monitor: bool = False,
+    timeout: float = 15.0,
 ) -> dict[str, Any]:
     driver = require_driver()
     if session_id is not None:
         switch_session(session_id=session_id)
-    ensure_sessions()
-    return simphtml.execute_js_rich(script, driver, no_monitor=no_monitor)
+    sessions = ensure_sessions()
+    before_sids = {str(s.get("id")) for s in sessions}
+    return simphtml.execute_js_rich(
+        script, driver, no_monitor=no_monitor, timeout=timeout, before_sids=before_sids
+    )
 
 
 @mcp.tool(description="Call a single Chrome DevTools Protocol command on the current or specified tab.")
