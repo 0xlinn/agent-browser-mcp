@@ -80,13 +80,32 @@ def normalize_session_id(session_id: Optional[str]) -> Optional[str]:
     return str(session_id)
 
 
-def switch_session(session_id: Optional[str] = None, url_pattern: Optional[str] = None) -> str:
+def switch_session(
+    session_id: Optional[str] = None,
+    url_pattern: Optional[str] = None,
+    browser: Optional[str] = None,
+) -> str:
     driver = require_driver()
     if session_id is not None:
         sid = str(session_id)
         found = next((s for s in active_sessions() if str(s.get("id")) == sid), None)
         if not found:
             raise RuntimeError(f"Session {sid} not found")
+        driver.default_session_id = sid
+        return sid
+    if browser is not None:
+        # Pick a tab belonging to the named browser (chrome/edge/opera).
+        # Prefer one matching url_pattern too, if given.
+        want = browser.strip().lower()
+        cands = [s for s in active_sessions() if str(s.get("browser", "")).lower() == want]
+        if not cands:
+            avail = sorted({str(s.get("browser", "?")) for s in active_sessions()})
+            raise RuntimeError(f"No connected tab for browser '{want}'. Connected: {avail or 'none'}")
+        if url_pattern:
+            narrowed = [s for s in cands if url_pattern in str(s.get("url", ""))]
+            if narrowed:
+                cands = narrowed
+        sid = str(cands[0]["id"])
         driver.default_session_id = sid
         return sid
     if url_pattern:
@@ -150,9 +169,13 @@ def list_tabs() -> dict[str, Any]:
     }
 
 
-@mcp.tool(description="Set the active browser tab by session id or URL substring.")
-def switch_tab(session_id: Optional[str] = None, url_pattern: Optional[str] = None) -> dict[str, Any]:
-    sid = switch_session(session_id=session_id, url_pattern=url_pattern)
+@mcp.tool(description="Set the active browser tab by session id, URL substring, or browser name ('chrome'/'edge'/'opera').")
+def switch_tab(
+    session_id: Optional[str] = None,
+    url_pattern: Optional[str] = None,
+    browser: Optional[str] = None,
+) -> dict[str, Any]:
+    sid = switch_session(session_id=session_id, url_pattern=url_pattern, browser=browser)
     return {"active_session_id": sid, "tabs": compact_tabs()}
 
 

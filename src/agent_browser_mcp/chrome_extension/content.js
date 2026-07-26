@@ -3,15 +3,32 @@
 // Remove meta CSP tags
 document.querySelectorAll('meta[http-equiv="Content-Security-Policy"]').forEach(e => e.remove());
 
-// Indicator badge at bottom-right (userscript style)
+// Indicator badge — reflects real WS status via background (green=bridge, orange=inject-only)
 (function(){
   if(window.self!==window.top)return;
   const d=document.createElement('div');
   d.id='ljq-ind';
-  d.innerText='ljq_driver: 已连接';
-  d.style.cssText='position:fixed;bottom:8px;right:8px;background:#4CAF50;color:white;padding:4px 7px;border-radius:4px;font-size:11px;font-weight:bold;z-index:99999;cursor:pointer;box-shadow:0 2px 4px rgba(0,0,0,0.2);opacity:0.5;';
-  d.addEventListener('click',()=>alert('会话活跃\nURL: '+location.href));
+  d.innerText='ljq_driver: 检测中';
+  d.style.cssText='position:fixed;bottom:8px;right:8px;background:#888;color:white;padding:4px 7px;border-radius:4px;font-size:11px;font-weight:bold;z-index:99999;cursor:pointer;box-shadow:0 2px 4px rgba(0,0,0,0.2);opacity:0.85;';
+  function paint(ok){
+    d.innerText = ok ? 'ljq_driver: 已连接' : 'ljq_driver: 桥未连';
+    d.style.background = ok ? '#4CAF50' : '#e67e22';
+  }
+  d.addEventListener('click',()=>{
+    try {
+      chrome.runtime.sendMessage({cmd:'tmwd_ping'}, (r)=>{
+        paint(!!(r && r.ws));
+        alert((r && r.ws ? '桥已连接' : '桥未连接') + '\nURL: '+location.href+'\nreadyState='+(r?r.readyState:'?'));
+      });
+    } catch(e) { alert('扩展消息失败: '+e.message); }
+  });
   (document.body||document.documentElement).appendChild(d);
+  try {
+    chrome.runtime.sendMessage({cmd:'tmwd_ping'}, (r)=> paint(!!(r && r.ws)));
+  } catch(_) { paint(false); }
+  setInterval(()=>{
+    try { chrome.runtime.sendMessage({cmd:'tmwd_ping'}, (r)=> paint(!!(r && r.ws))); } catch(_) {}
+  }, 5000);
 })();
 
 new MutationObserver(muts => {
@@ -36,6 +53,24 @@ async function handle(el) {
       resp = await chrome.runtime.sendMessage({ cmd: 'batch', commands: req.commands, tabId: req.tabId });
     } else if (cmd === 'tabs') {
       resp = await chrome.runtime.sendMessage({ cmd: 'tabs', method: req.method, tabId: req.tabId });
+    } else if (cmd === 'bookmarks') {
+      resp = await chrome.runtime.sendMessage({
+        cmd: 'bookmarks',
+        method: req.method,
+        id: req.id,
+        node: req.node,
+        destination: req.destination,
+        changes: req.changes,
+        rootId: req.rootId,
+        folderPaths: req.folderPaths,
+        assignments: req.assignments,
+        removeFolderIds: req.removeFolderIds,
+        creates: req.creates,
+        updates: req.updates,
+        ids: req.ids
+      });
+    } else if (cmd === 'management') {
+      resp = await chrome.runtime.sendMessage({ cmd: 'management', method: req.method, extId: req.extId, showConfirmDialog: req.showConfirmDialog });
     } else {
       resp = { ok: false, error: 'unknown cmd: ' + cmd };
     }

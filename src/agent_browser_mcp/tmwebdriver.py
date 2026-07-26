@@ -131,15 +131,26 @@ class TMWebDriver:
                         driver._register_client(session_id, self, session_info)  
                     elif data.get('type') in ['ext_ready', 'tabs_update']:
                         tabs = data.get('tabs', [])
-                        current_tab_ids = {str(tab['id']) for tab in tabs}
-                        print(f"Received tabs update: {current_tab_ids}")
+                        # Namespace sessions per browser instance so Chrome/Edge (and
+                        # multiple profiles) don't collide on identical small tab ids.
+                        # Fall back to the connection identity if an older extension
+                        # doesn't send clientId.
+                        client_id = data.get('clientId') or f"conn{id(self)}"
+                        browser = data.get('browser', '')
+                        def _sid(tab_id): return f"{client_id}:{tab_id}"
+                        current_tab_ids = {_sid(tab['id']) for tab in tabs}
+                        print(f"Received tabs update from {client_id} ({browser}): {current_tab_ids}")
+                        # Only sweep sessions belonging to THIS client; another
+                        # browser's update must not disconnect this browser's tabs.
                         for sid in list(driver.sessions.keys()):
                             sess = driver.sessions[sid]
-                            if sess.type == 'ext_ws' and sid not in current_tab_ids:
+                            if sess.type == 'ext_ws' and sess.info.get('client_id') == client_id and sid not in current_tab_ids:
                                 sess.mark_disconnected()
                         for tab in tabs:
-                            session_id = str(tab['id'])
-                            session_info = {'url': tab.get('url'), 'title': tab.get('title', ''), 'connected_at': time.time(), 'type': 'ext_ws'}
+                            session_id = _sid(tab['id'])
+                            session_info = {'url': tab.get('url'), 'title': tab.get('title', ''),
+                                'connected_at': time.time(), 'type': 'ext_ws',
+                                'client_id': client_id, 'browser': browser, 'tab_id': tab['id']}
                             sess = driver.sessions.get(session_id)
                             if sess and sess.is_active(): sess.info = session_info
                             else: driver._register_client(session_id, self, session_info)
@@ -207,7 +218,9 @@ class TMWebDriver:
         assert tp in ['ws', 'http', 'ext_ws'], f"Unsupported session type: {tp}"
         exec_id = str(uuid.uuid4())  
         payload_dict = {'id': exec_id, 'code': code}
-        if tp == 'ext_ws': payload_dict['tabId'] = int(session.id)
+        if tp == 'ext_ws':
+            # session.id is now "client_id:tab_id"; use the raw browser tab id.
+            payload_dict['tabId'] = int(session.info.get('tab_id', str(session.id).rsplit(':', 1)[-1]))
         payload = json.dumps(payload_dict)
 
         if tp in ['ws', 'ext_ws']: session.ws_client.send_message(payload)  

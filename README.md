@@ -35,10 +35,13 @@
 这个项目把真实浏览器自动化能力包装成了标准 MCP 工具，重点能力包括：
 
 ### 1. 浏览器标签页与导航
-- 查看当前已连接的真实标签页
-- 切换到指定标签页
+- 查看当前已连接的真实标签页（每个标签带 `browser` 字段，区分 chrome / edge）
+- 切换到指定标签页（可按 session id、URL 关键字，或浏览器名 `chrome`/`edge` 选择）
 - 在当前标签页打开 URL
 - 新建标签页
+
+> 支持 Chrome 与 Edge 同时连接：两个浏览器都加载扩展后各自独立成会话，互不覆盖。
+> 用 `switch_tab(browser="edge")` 或 `switch_tab(browser="chrome")` 指定目标浏览器。
 
 ### 2. 页面读取
 - 扫描当前页面内容
@@ -91,6 +94,7 @@
   - WebSocket: `127.0.0.1:18765`
   - HTTP: `127.0.0.1:18766`
 - 负责连接扩展、维护会话、转发执行结果
+- Chrome 和 Edge 可同时连同一个桥：每个浏览器上报自己的 `clientId` + `browser`，会话按 `clientId:tabId` 命名，互不覆盖、互不断开
 
 3. MCP 服务
 - 把浏览器能力暴露为 MCP tools
@@ -213,6 +217,8 @@ chrome://extensions
 - 打开“开发者模式”
 - 点击“加载已解压的扩展程序”
 - 选择上一步输出的目录
+
+如果你也用 Edge，在 `edge://extensions` 里重复同样的步骤加载同一个目录即可。桥会自动区分 Chrome 与 Edge（以及同一浏览器的多个 profile），两边可以同时连接、互不干扰。用 `switch_tab(browser="edge")` 或 `switch_tab(browser="chrome")` 指定目标浏览器。
 
 ### 第三步：打开正常网页
 

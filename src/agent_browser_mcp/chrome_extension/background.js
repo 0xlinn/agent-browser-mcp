@@ -50,6 +50,194 @@ async function handleExtMessage(msg, sender) {
         await chrome.management.setEnabled(msg.extId, true);
         return { ok: true };
       }
+      if (msg.method === 'uninstall') {
+        await chrome.management.uninstall(msg.extId, { showConfirmDialog: msg.showConfirmDialog !== false });
+        return { ok: true };
+      }
+      return { ok: false, error: 'Unknown method: ' + msg.method };
+    } catch (e) { return { ok: false, error: e.message }; }
+  }
+  if (msg.cmd === 'bookmarks') {
+    try {
+      if (msg.method === 'tree') {
+        return { ok: true, data: await chrome.bookmarks.getTree() };
+      }
+      if (msg.method === 'create') {
+        return { ok: true, data: await chrome.bookmarks.create(msg.node) };
+      }
+      if (msg.method === 'move') {
+        return { ok: true, data: await chrome.bookmarks.move(msg.id, msg.destination) };
+      }
+      if (msg.method === 'update') {
+        return { ok: true, data: await chrome.bookmarks.update(msg.id, msg.changes) };
+      }
+      if (msg.method === 'bulkUpdateTitles') {
+        const updates = msg.updates || [];
+        let updated = 0;
+        const errors = [];
+        for (const item of updates) {
+          try {
+            await chrome.bookmarks.update(item.id, { title: item.title });
+            updated++;
+          } catch (e) {
+            errors.push({ id: item.id, error: e.message });
+          }
+        }
+        return { ok: errors.length === 0, updated, errors };
+      }
+      if (msg.method === 'removeTree') {
+        await chrome.bookmarks.removeTree(msg.id);
+        return { ok: true };
+      }
+      if (msg.method === 'remove') {
+        await chrome.bookmarks.remove(msg.id);
+        return { ok: true };
+      }
+      if (msg.method === 'bulkRemove') {
+        const ids = msg.ids || [];
+        let removed = 0;
+        const errors = [];
+        for (const id of ids) {
+          try {
+            await chrome.bookmarks.remove(id);
+            removed++;
+          } catch (e) {
+            errors.push({ id, error: e.message });
+          }
+        }
+        return { ok: errors.length === 0, removed, errors };
+      }
+      if (msg.method === 'bulkOrganize') {
+        const rootId = msg.rootId;
+        const folderPaths = msg.folderPaths || [];
+        const assignments = msg.assignments || [];
+        const removeFolderIds = msg.removeFolderIds || [];
+        const pathIds = {};
+
+        async function childrenOf(parentId) {
+          const nodes = await chrome.bookmarks.getChildren(parentId);
+          return nodes.filter(n => !n.url);
+        }
+
+        async function ensureFolder(parentId, title) {
+          const existing = (await childrenOf(parentId)).find(n => n.title === title);
+          if (existing) return existing.id;
+          const created = await chrome.bookmarks.create({ parentId, title });
+          return created.id;
+        }
+
+        async function ensurePath(parts) {
+          let parentId = rootId;
+          const walked = [];
+          for (const part of parts) {
+            walked.push(part);
+            const key = walked.join('\u0001');
+            if (!pathIds[key]) pathIds[key] = await ensureFolder(parentId, part);
+            parentId = pathIds[key];
+          }
+          return parentId;
+        }
+
+        for (const parts of folderPaths) await ensurePath(parts);
+
+        let moved = 0;
+        for (const item of assignments) {
+          const parentId = await ensurePath(item.path);
+          await chrome.bookmarks.move(item.id, { parentId });
+          moved++;
+        }
+
+        function countUrls(node) {
+          if (node.url) return 1;
+          return (node.children || []).reduce((sum, child) => sum + countUrls(child), 0);
+        }
+
+        let removedFolders = 0;
+        for (const id of removeFolderIds) {
+          const nodes = await chrome.bookmarks.getSubTree(id).catch(() => []);
+          if (!nodes.length) continue;
+          if (countUrls(nodes[0]) === 0) {
+            await chrome.bookmarks.removeTree(id);
+            removedFolders++;
+          }
+        }
+        return { ok: true, moved, removedFolders };
+      }
+      if (msg.method === 'bulkCreate') {
+        const rootId = msg.rootId;
+        const folderPaths = msg.folderPaths || [];
+        const creates = msg.creates || [];
+        const pathIds = {};
+
+        async function childrenOf(parentId) {
+          const nodes = await chrome.bookmarks.getChildren(parentId);
+          return nodes.filter(n => !n.url);
+        }
+
+        async function ensureFolder(parentId, title) {
+          const existing = (await childrenOf(parentId)).find(n => n.title === title);
+          if (existing) return existing.id;
+          const created = await chrome.bookmarks.create({ parentId, title });
+          return created.id;
+        }
+
+        async function ensurePath(parts) {
+          let parentId = rootId;
+          const walked = [];
+          for (const part of parts) {
+            walked.push(part);
+            const key = walked.join('\u0001');
+            if (!pathIds[key]) pathIds[key] = await ensureFolder(parentId, part);
+            parentId = pathIds[key];
+          }
+          return parentId;
+        }
+
+        for (const parts of folderPaths) await ensurePath(parts);
+
+        const existingUrls = new Set();
+        function normalizeUrl(raw) {
+          try {
+            const u = new URL(raw);
+            u.hash = '';
+            for (const key of Array.from(u.searchParams.keys())) {
+              const lower = key.toLowerCase();
+              if (lower.startsWith('utm_') || lower === 'fbclid' || lower === 'gclid') {
+                u.searchParams.delete(key);
+              }
+            }
+            u.hostname = u.hostname.replace(/^www\./, '').toLowerCase();
+            u.pathname = u.pathname.replace(/\/+$/, '') || '/';
+            return u.toString();
+          } catch (_) {
+            return String(raw || '').trim().toLowerCase();
+          }
+        }
+
+        async function collectUrls(parentId) {
+          const children = await chrome.bookmarks.getChildren(parentId);
+          for (const child of children) {
+            if (child.url) existingUrls.add(normalizeUrl(child.url));
+            else await collectUrls(child.id);
+          }
+        }
+        await collectUrls(rootId);
+
+        let created = 0;
+        let skipped = 0;
+        for (const item of creates) {
+          const key = normalizeUrl(item.url);
+          if (existingUrls.has(key)) {
+            skipped++;
+            continue;
+          }
+          const parentId = await ensurePath(item.path);
+          await chrome.bookmarks.create({ parentId, title: item.title || item.url, url: item.url });
+          existingUrls.add(key);
+          created++;
+        }
+        return { ok: true, created, skipped };
+      }
       return { ok: false, error: 'Unknown method: ' + msg.method };
     } catch (e) { return { ok: false, error: e.message }; }
   }
@@ -189,11 +377,34 @@ function buildCdpScript(code) {
 
 // --- WebSocket Client for TMWebDriver ---
 let ws = null;
+let connectInFlight = false;
 const WS_URL = 'ws://127.0.0.1:18765';
+const HTTP_PROBE = 'http://127.0.0.1:18766/link';
+
+// --- Browser identity: distinguishes Chrome vs Edge vs multiple profiles ---
+// Without this, Chrome tab 456 and Edge tab 456 collide into one server session.
+let CLIENT_ID = null;
+function getBrowserType() {
+  const ua = navigator.userAgent;
+  if (ua.includes('Edg/')) return 'edge';       // must test before Chrome; Edge UA also has 'Chrome/'
+  if (ua.includes('OPR/')) return 'opera';
+  if (ua.includes('Chrome/')) return 'chrome';
+  return 'unknown';
+}
+async function getClientId() {
+  if (CLIENT_ID) return CLIENT_ID;
+  const s = await chrome.storage.local.get('tmwd_client_id');
+  if (s.tmwd_client_id) { CLIENT_ID = s.tmwd_client_id; return CLIENT_ID; }
+  // Per-profile: chrome.storage.local is isolated per profile, so two profiles of the
+  // same browser get distinct ids too.
+  CLIENT_ID = getBrowserType() + '_' + Math.random().toString(36).slice(2, 8);
+  await chrome.storage.local.set({ tmwd_client_id: CLIENT_ID });
+  return CLIENT_ID;
+}
 
 function scheduleProbe() {
-  // Use chrome.alarms to survive MV3 service worker suspension
-  chrome.alarms.create('tmwd-ws-probe', { delayInMinutes: 0.083 }); // ~5s
+  // MV3 clamps sub-minute alarms aggressively; also wake via tabs/events below.
+  chrome.alarms.create('tmwd-ws-probe', { delayInMinutes: 0.5, periodInMinutes: 1 });
 }
 
 function scheduleKeepalive() {
@@ -202,14 +413,34 @@ function scheduleKeepalive() {
 }
 
 async function isServerAlive() {
+  // Probe HTTP side (18766), not the WS port (18765 returns 426 and may confuse fetch).
   try {
     const ctrl = new AbortController();
-    setTimeout(() => ctrl.abort(), 2000);
-    await fetch('http://127.0.0.1:18765', { signal: ctrl.signal });
-    return true; // Got HTTP response → port is listening
-  } catch (e) {
-    return false; // Network error (connection refused) or timeout → server not alive
+    setTimeout(() => ctrl.abort(), 1500);
+    await fetch(HTTP_PROBE, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cmd: 'get_all_sessions' }),
+      signal: ctrl.signal,
+    });
+    return true;
+  } catch (_) {
+    // Network refused / timeout. Still try WS: some stacks answer WS but not this route.
+    try {
+      const ctrl2 = new AbortController();
+      setTimeout(() => ctrl2.abort(), 800);
+      await fetch('http://127.0.0.1:18765/', { signal: ctrl2.signal });
+      return true; // any response including 426 means port is open
+    } catch (e2) {
+      return false;
+    }
   }
+}
+
+function ensureConnected(reason) {
+  if (ws && ws.readyState <= 1) return;
+  console.log('[TMWD-WS] ensureConnected:', reason || '');
+  connectWS();
 }
 
 chrome.alarms.onAlarm.addListener(async (alarm) => {
@@ -225,17 +456,16 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     } else {
       // Connection lost, switch to probe mode
       ws = null;
+      ensureConnected('keepalive-lost');
       scheduleProbe();
     }
   }
   if (alarm.name === 'tmwd-ws-probe') {
     if (ws && ws.readyState <= 1) return; // Already connected/connecting
-    if (await isServerAlive()) {
-      console.log('[TMWD-WS] Server detected, connecting...');
-      connectWS();
-    } else {
-      scheduleProbe(); // Server not up, keep probing
-    }
+    // Always attempt WS; isServerAlive is only a log hint (HTTP probe is unreliable).
+    const alive = await isServerAlive();
+    console.log('[TMWD-WS] probe tick, httpAlive=', alive);
+    ensureConnected('alarm-probe');
   }
 });
 
@@ -313,6 +543,8 @@ async function handleWsExec(data) {
 
 function connectWS() {
   if (ws && ws.readyState <= 1) return; // CONNECTING or OPEN
+  if (connectInFlight) return;
+  connectInFlight = true;
   ws = null;
   console.log('[TMWD-WS] Connecting to', WS_URL);
   try {
@@ -320,18 +552,27 @@ function connectWS() {
   } catch (e) {
     console.error('[TMWD-WS] Constructor error:', e);
     ws = null;
+    connectInFlight = false;
     scheduleProbe();
     return;
   }
   ws.onopen = async () => {
+    connectInFlight = false;
     console.log('[TMWD-WS] Connected!');
     scheduleKeepalive(); // Keep SW alive while connected
-    const tabs = (await chrome.tabs.query({})).filter(t => isScriptable(t.url));
-    ws.send(JSON.stringify({
-      type: 'ext_ready',
-      tabs: tabs.map(t => ({ id: t.id, url: t.url, title: t.title }))
-    }));
-    console.log('[TMWD-WS] Sent ext_ready with', tabs.length, 'tabs');
+    try {
+      const clientId = await getClientId();
+      const tabs = (await chrome.tabs.query({})).filter(t => isScriptable(t.url));
+      ws.send(JSON.stringify({
+        type: 'ext_ready',
+        clientId,
+        browser: getBrowserType(),
+        tabs: tabs.map(t => ({ id: t.id, url: t.url, title: t.title }))
+      }));
+      console.log('[TMWD-WS] Sent ext_ready with', tabs.length, 'tabs as', clientId);
+    } catch (e) {
+      console.error('[TMWD-WS] ext_ready failed', e);
+    }
   };
   ws.onmessage = async (event) => {
     try {
@@ -364,6 +605,7 @@ function connectWS() {
   ws.onclose = () => {
     console.log('[TMWD-WS] Disconnected');
     ws = null;
+    connectInFlight = false;
     scheduleProbe();
   };
   ws.onerror = (e) => {
@@ -373,21 +615,43 @@ function connectWS() {
 }
 
 // Initial connect + wake-up hooks
-connectWS();
-chrome.runtime.onStartup.addListener(() => connectWS());
-chrome.runtime.onInstalled.addListener(() => connectWS());
+ensureConnected('boot');
+chrome.runtime.onStartup.addListener(() => ensureConnected('onStartup'));
+chrome.runtime.onInstalled.addListener(() => ensureConnected('onInstalled'));
+// Popup / content can poke SW awake
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (msg && msg.cmd === 'tmwd_ping') {
+    ensureConnected('runtime-message');
+    sendResponse({
+      ok: true,
+      ws: !!(ws && ws.readyState === WebSocket.OPEN),
+      readyState: ws ? ws.readyState : -1,
+    });
+    return true;
+  }
+  return false;
+});
 
-// Sync tab list on changes
+// Sync tab list on changes — also re-open WS if SW slept
 async function sendTabsUpdate() {
+  ensureConnected('tabs-event');
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   const tabs = (await chrome.tabs.query({})).filter(t => isScriptable(t.url) && !/streamlit/i.test(t.title));
-  ws.send(JSON.stringify({
-    type: 'tabs_update',
-    tabs: tabs.map(t => ({ id: t.id, url: t.url, title: t.title }))
-  }));
+  try {
+    const clientId = await getClientId();
+    ws.send(JSON.stringify({
+      type: 'tabs_update',
+      clientId,
+      browser: getBrowserType(),
+      tabs: tabs.map(t => ({ id: t.id, url: t.url, title: t.title }))
+    }));
+  } catch (e) {
+    console.error('[TMWD-WS] tabs_update send failed', e);
+  }
 }
 chrome.tabs.onUpdated.addListener((_, changeInfo) => {
-  if (changeInfo.status === 'complete') sendTabsUpdate();
+  if (changeInfo.status === 'complete' || changeInfo.url) sendTabsUpdate();
 });
 chrome.tabs.onRemoved.addListener(() => sendTabsUpdate());
 chrome.tabs.onCreated.addListener(() => sendTabsUpdate());
+chrome.tabs.onActivated.addListener(() => ensureConnected('tab-activated'));
