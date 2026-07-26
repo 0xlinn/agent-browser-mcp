@@ -12,3 +12,13 @@ venv/
 .env
 .DS_Store
 src/agent_browser_mcp/chrome_extension/config.js
+*.log
+log
+temp_desktop.png
+
+# local scratch files
+_*.json
+_*.txt
+_*.md
+_mkq.py
+dune_editor.png
