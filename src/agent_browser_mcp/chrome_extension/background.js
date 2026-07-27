@@ -696,7 +696,11 @@ chrome.runtime.onConnect.addListener((port) => {
   if (ws && ws.readyState === WebSocket.OPEN) {
     try { sendTabsUpdate(); } catch (_) {}
   }
-  port.onDisconnect.addListener(() => { /* content side will reconnect */ });
+  // Consume lastError: when the content page enters bfcache Chrome closes this
+  // port and sets lastError ("moved into back/forward cache"). Not reading it
+  // logs an "Unchecked runtime.lastError" warning every navigation. The content
+  // side re-opens the port on its next poll / pageshow, so nothing to do here.
+  port.onDisconnect.addListener(() => { void chrome.runtime.lastError; });
 });
 // Popup / content can poke SW awake
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
