@@ -232,12 +232,15 @@ def switch_session(
 
 def exec_js(script: str, session_id: Optional[str] = None, timeout: float = 15.0) -> dict[str, Any]:
     driver = require_driver()
-    if session_id is not None:
-        driver.default_session_id = str(session_id)
-    response = driver.execute_js(script, timeout=timeout)
+    # Pass the target session through per-call instead of mutating the global
+    # default_session_id. A directed call ("run this on tab Y") must not steal
+    # the shared default out from under a concurrent task working on tab X.
+    # session_id=None falls back to the driver's default inside execute_js.
+    sid = str(session_id) if session_id is not None else None
+    response = driver.execute_js(script, timeout=timeout, session_id=sid)
     if simphtml.no_response_kind(response) == "undelivered":
         # Never reached the page; retrying is side-effect-free.
-        response = driver.execute_js(script, timeout=timeout)
+        response = driver.execute_js(script, timeout=timeout, session_id=sid)
     kind = simphtml.no_response_kind(response)
     if kind:
         # Tools built on this helper (CDP, cookies, screenshots) have nothing
@@ -353,9 +356,8 @@ def extension_path() -> dict[str, Any]:
 
 @mcp.tool(description="List Chrome extensions visible to the CDP bridge extension itself.")
 def list_extensions(session_id: Optional[str] = None) -> dict[str, Any]:
-    if session_id is not None:
-        switch_session(session_id=session_id)
-    return exec_js(json.dumps({"cmd": "management", "method": "list"}), timeout=20.0)
+    return exec_js(json.dumps({"cmd": "management", "method": "list"}),
+                   session_id=session_id, timeout=20.0)
 
 
 @mcp.tool(description="Read the current page as simplified HTML/text, preserving login state from the real browser.")
@@ -369,21 +371,32 @@ def scan_page(
     timeout: float = 15.0,
 ) -> dict[str, Any]:
     driver = require_driver()
+    ensure_sessions()
+    # Target a specific tab without permanently clobbering the shared default:
+    # the monitor pipeline (get_html) does several driver.execute_js roundtrips
+    # that read default_session_id, so we point it at the target for the call's
+    # duration and restore it in finally. Otherwise a session_id-scoped scan_page
+    # would leave the global default on this tab and hijack other tasks' work.
+    prev_default = driver.default_session_id
     if session_id is not None:
         switch_session(session_id=session_id)
-    ensure_sessions()
-    content = simphtml.get_html(
-        driver,
-        cutlist=cutlist,
-        maxchars=maxchars,
-        instruction=instruction,
-        extra_js=extra_js,
-        text_only=text_only,
-        timeout=timeout,
-    )
+    try:
+        content = simphtml.get_html(
+            driver,
+            cutlist=cutlist,
+            maxchars=maxchars,
+            instruction=instruction,
+            extra_js=extra_js,
+            text_only=text_only,
+            timeout=timeout,
+        )
+        active = driver.default_session_id
+    finally:
+        if session_id is not None:
+            driver.default_session_id = prev_default
     return {
         "status": "success",
-        "active_session_id": driver.default_session_id,
+        "active_session_id": active,
         "tabs": compact_tabs(),
         "content": content,
     }
@@ -397,13 +410,22 @@ def execute_js(
     timeout: float = 15.0,
 ) -> dict[str, Any]:
     driver = require_driver()
-    if session_id is not None:
-        switch_session(session_id=session_id)
     sessions = ensure_sessions()
     before_sids = {str(s.get("id")) for s in sessions}
-    return simphtml.execute_js_rich(
-        script, driver, no_monitor=no_monitor, timeout=timeout, before_sids=before_sids
-    )
+    # Point the shared default at the target only for this call's roundtrips
+    # (execute_js_rich does baseline/diff/transient snapshots that read the
+    # global default), then restore — a session_id-scoped call must not leave
+    # the default parked on this tab and steal another task's session.
+    prev_default = driver.default_session_id
+    if session_id is not None:
+        switch_session(session_id=session_id)
+    try:
+        return simphtml.execute_js_rich(
+            script, driver, no_monitor=no_monitor, timeout=timeout, before_sids=before_sids
+        )
+    finally:
+        if session_id is not None:
+            driver.default_session_id = prev_default
 
 
 @mcp.tool(description="Call a single Chrome DevTools Protocol command on the current or specified tab.")
@@ -413,33 +435,27 @@ def cdp_command(
     session_id: Optional[str] = None,
     tab_id: Optional[int] = None,
 ) -> dict[str, Any]:
-    if session_id is not None:
-        switch_session(session_id=session_id)
     params = json.loads(params_json or "{}")
     payload: dict[str, Any] = {"cmd": "cdp", "method": method, "params": params}
     if tab_id is not None:
         payload["tabId"] = tab_id
-    return exec_js(json.dumps(payload), timeout=20.0)
+    return exec_js(json.dumps(payload), session_id=session_id, timeout=20.0)
 
 
 @mcp.tool(description="Run a CDP bridge batch command; pass the full JSON command object as text.")
 def cdp_batch(batch_json: str, session_id: Optional[str] = None) -> dict[str, Any]:
-    if session_id is not None:
-        switch_session(session_id=session_id)
     payload = json.loads(batch_json)
     if payload.get("cmd") != "batch":
         raise RuntimeError("batch_json must be a JSON object with cmd='batch'")
-    return exec_js(json.dumps(payload), timeout=30.0)
+    return exec_js(json.dumps(payload), session_id=session_id, timeout=30.0)
 
 
 @mcp.tool(description="Get cookies for the current page or specified tab via the Chrome extension bridge.")
 def get_cookies(session_id: Optional[str] = None, tab_id: Optional[int] = None) -> dict[str, Any]:
-    if session_id is not None:
-        switch_session(session_id=session_id)
     payload: dict[str, Any] = {"cmd": "cookies"}
     if tab_id is not None:
         payload["tabId"] = tab_id
-    return exec_js(json.dumps(payload), timeout=15.0)
+    return exec_js(json.dumps(payload), session_id=session_id, timeout=15.0)
 
 
 @mcp.tool(description="Capture a screenshot of the current page/tab via CDP. Prefer save_path (then view the file); base64 is returned only without save_path or with return_base64=true.")
@@ -450,8 +466,6 @@ def capture_page_screenshot(
     save_path: str = "",
     return_base64: bool = False,
 ) -> dict[str, Any]:
-    if session_id is not None:
-        switch_session(session_id=session_id)
     payload: dict[str, Any] = {
         "cmd": "cdp",
         "method": "Page.captureScreenshot",
@@ -459,7 +473,7 @@ def capture_page_screenshot(
     }
     if tab_id is not None:
         payload["tabId"] = tab_id
-    result = exec_js(json.dumps(payload), timeout=20.0)
+    result = exec_js(json.dumps(payload), session_id=session_id, timeout=20.0)
     data = result.get("data")
     if isinstance(data, dict) and "data" in data:
         b64 = data["data"]
