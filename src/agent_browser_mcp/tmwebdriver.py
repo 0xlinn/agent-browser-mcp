@@ -155,10 +155,16 @@ class TMWebDriver:
 
     def clean_sessions(self):
         now = time.time()
+        # Snapshot keys, then re-fetch with .get: another thread (WS handler or a
+        # concurrent clean_sessions from a parallel /link call) may delete a
+        # session between the snapshot and access, so both the read and the
+        # delete must tolerate a missing key instead of raising KeyError.
         for sid in list(self.sessions.keys()):
-            session = self.sessions[sid]
-            if not session.is_active() and now - session.disconnect_at > 600:
-                del self.sessions[sid]
+            session = self.sessions.get(sid)
+            if session is None: continue
+            if not session.is_active() and session.disconnect_at is not None \
+                    and now - session.disconnect_at > 600:
+                self.sessions.pop(sid, None)
         # Results/acks that arrive after their caller already timed out would
         # otherwise accumulate forever in a long-lived daemon.
         for r_id in list(self.results.keys()):
