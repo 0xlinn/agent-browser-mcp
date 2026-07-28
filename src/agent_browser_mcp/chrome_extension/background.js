@@ -50,6 +50,12 @@ async function handleExtMessage(msg, sender) {
         const tab = await chrome.tabs.update(msg.tabId, { active: true });
         await chrome.windows.update(tab.windowId, { focused: true });
         return { ok: true };
+      } else if (msg.method === 'create') {
+        // Native tab creation — runs in the SW, so it needs NO existing tab.
+        // This replaces the old GM_openInTab path (a Tampermonkey API that
+        // does not exist in a plain extension, so open_new_tab always threw).
+        const tab = await chrome.tabs.create({ url: msg.url || 'about:blank', active: msg.active !== false });
+        return { ok: true, data: { id: tab.id, url: tab.url || tab.pendingUrl || msg.url, title: tab.title, windowId: tab.windowId } };
       } else {
         const tabs = (await chrome.tabs.query({})).filter(t => isScriptable(t.url));
         const data = tabs.map(t => ({ id: t.id, url: t.url, title: t.title, active: t.active, windowId: t.windowId }));

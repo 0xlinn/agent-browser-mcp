@@ -464,7 +464,10 @@ class TMWebDriver:
     def jump(self, url, timeout=10): self.execute_js(f"window.location.href={json.dumps(url)}", timeout=timeout)
     def newtab(self, url=None):
         if url is None: url = "http://www.baidu.com/robots.txt"
-        return self.execute_js(f'GM_openInTab({json.dumps(url)});')
+        # Native chrome.tabs.create via the cmd channel (routed to the SW, not
+        # eval'd in a page). The old GM_openInTab was a Tampermonkey-only API
+        # absent from a plain extension, so it always threw ReferenceError.
+        return self.execute_js(json.dumps({"cmd": "tabs", "method": "create", "url": url}))
     
 if __name__ == "__main__":
     driver = TMWebDriver(host='127.0.0.1', port=18765)
