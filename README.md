@@ -193,7 +193,8 @@ agent-browser-mcp doctor
 - `config.js` 是否生成
 - 端口状态
 - 当前连接到的标签页数量
-- 下一步建议
+
+并给出一个结构化诊断：`cause` 是故障判定（如 `healthy` / `ext_never_registered` / `sw_slept_or_dropped` / `bridge_unreachable`），`advice` 是对应的一句话修复建议——不用再手动 netstat + curl 逐层排查。
 
 ## Chrome 扩展安装
 
