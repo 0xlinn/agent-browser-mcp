@@ -50,6 +50,11 @@ async function handleExtMessage(msg, sender) {
         const tab = await chrome.tabs.update(msg.tabId, { active: true });
         await chrome.windows.update(tab.windowId, { focused: true });
         return { ok: true };
+      } else if (msg.method === 'close') {
+        // Works on chrome-extension:// pages too, which never become sessions
+        // and so can't be closed through any session-scoped path.
+        await chrome.tabs.remove(Array.isArray(msg.tabId) ? msg.tabId : [msg.tabId]);
+        return { ok: true };
       } else if (msg.method === 'create') {
         // Native tab creation — runs in the SW, so it needs NO existing tab.
         // This replaces the old GM_openInTab path (a Tampermonkey API that
@@ -57,7 +62,11 @@ async function handleExtMessage(msg, sender) {
         const tab = await chrome.tabs.create({ url: msg.url || 'about:blank', active: msg.active !== false });
         return { ok: true, data: { id: tab.id, url: tab.url || tab.pendingUrl || msg.url, title: tab.title, windowId: tab.windowId } };
       } else {
-        const tabs = (await chrome.tabs.query({})).filter(t => isScriptable(t.url));
+        // all:true also reveals chrome-extension:// pages. They never become
+        // sessions (content scripts can't run there), but chrome.debugger CAN
+        // attach to them, so CDP is the only way to drive an extension's own UI.
+        const tabs = (await chrome.tabs.query({}))
+          .filter(t => msg.all ? true : isScriptable(t.url));
         const data = tabs.map(t => ({ id: t.id, url: t.url, title: t.title, active: t.active, windowId: t.windowId }));
         return { ok: true, data };
       }
