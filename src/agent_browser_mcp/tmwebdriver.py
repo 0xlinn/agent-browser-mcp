@@ -47,6 +47,10 @@ class TMWebDriver:
         self.last_ext_seen = None
         # Per-client last-seen: which browser is stale vs which just dropped.
         self.client_last_seen = {}
+        # client_id -> {'ws','browser','ts'}: the extension's own socket, one per
+        # browser, independent of how many tabs exist. Addresses the service
+        # worker directly for tab-less commands; see ext_cmd().
+        self.ext_clients = {}
         with socket.socket() as _probe:
             _probe.settimeout(1)
             self.is_remote = _probe.connect_ex((host, port+1)) == 0
@@ -132,6 +136,14 @@ class TMWebDriver:
             if data.get('cmd') == 'find_session': 
                 url_pattern = data.get('url_pattern', '')
                 return json.dumps({'r': self.find_session(url_pattern)}, ensure_ascii=False)
+            if data.get('cmd') == 'ext_cmd':
+                try:
+                    result = self.ext_cmd(data.get('payload') or {},
+                                          client_id=data.get('clientId'),
+                                          timeout=float(data.get('timeout', 15.0)))
+                    return json.dumps({'r': result}, ensure_ascii=False)
+                except Exception as e:
+                    return json.dumps({'r': {'error': str(e)}}, ensure_ascii=False)
             if data.get('cmd') == 'execute_js':
                 session_id = data.get('sessionId')
                 code = data.get('code')
@@ -213,6 +225,12 @@ class TMWebDriver:
                         browser = data.get('browser', '')
                         driver.last_ext_seen = time.time()
                         if client_id: driver.client_last_seen[client_id] = {'ts': time.time(), 'browser': browser}
+                        # Keep the CLIENT-level socket. It is one per browser and
+                        # exists regardless of tab count, so SW-side commands
+                        # (chrome.tabs.create) still work with zero open tabs —
+                        # per-tab sessions can't express that.
+                        if client_id:
+                            driver.ext_clients[client_id] = {'ws': self, 'browser': browser, 'ts': time.time()}
                         def _sid(tab_id): return f"{client_id}:{tab_id}"
                         current_tab_ids = {_sid(tab['id']) for tab in tabs}
                         print(f"Received tabs update from {client_id} ({browser}): {current_tab_ids}")
@@ -297,9 +315,13 @@ class TMWebDriver:
         self.latest_session_id = session_id
         if self.default_session_id is None: self.default_session_id = session_id 
     
-    def _unregister_client(self, client: WebSocket) -> None:  
+    def _unregister_client(self, client: WebSocket) -> None:
         for session in self.sessions.values():
             if session.ws_client == client: session.mark_disconnected()
+        # Drop the client-level socket too, else ext_cmd would keep writing into
+        # a closed connection instead of failing over to a live browser.
+        for cid in [c for c, v in self.ext_clients.items() if v.get('ws') is client]:
+            self.ext_clients.pop(cid, None)
     
     def execute_js(self, code, timeout=15, session_id=None) -> Any:  
         if session_id is None: session_id = self.default_session_id  
@@ -383,6 +405,50 @@ class TMWebDriver:
         if newtabs: rr['newTabs'] = newtabs
         return rr
     
+    def ext_cmd(self, cmd: dict, client_id=None, timeout=15):
+        """Send a command straight to an extension service worker.
+
+        The extension's socket is per-browser, so this works with ZERO open
+        tabs: background.js routes any payload carrying `.cmd` to
+        handleExtMessage, which runs in the SW. Plain JS still needs a tab
+        (handleWsExec requires tabId) — that asymmetry is the whole point.
+        """
+        if self.is_remote:
+            response = self._remote_cmd({"cmd": "ext_cmd", "payload": cmd,
+                                         "clientId": client_id, "timeout": str(timeout)},
+                                        timeout=float(timeout) + 10).get('r', {})
+            if response.get('error'): raise Exception(response['error'])
+            return response
+
+        if client_id is None:
+            # Prefer the browser the caller already works in, so a stray command
+            # can't open tabs in the other browser.
+            want = (str(self.default_session_id).rsplit(':', 1)[0]
+                    if self.default_session_id and ':' in str(self.default_session_id) else None)
+            if want and want in self.ext_clients: client_id = want
+            elif self.ext_clients:
+                client_id = max(self.ext_clients.items(), key=lambda kv: kv[1].get('ts', 0))[0]
+        entry = self.ext_clients.get(client_id)
+        if not entry:
+            raise ValueError("没有已连接的扩展(ext_clients 为空):检查扩展是否加载、桥是否在运行")
+
+        exec_id = str(uuid.uuid4())
+        try:
+            entry['ws'].send_message(json.dumps({'id': exec_id, 'code': cmd}))
+        except Exception as e:
+            self.ext_clients.pop(client_id, None)
+            raise ValueError(f"扩展 {client_id} 连接已失效({e})，已丢弃,请重试")
+
+        start_time = time.time()
+        while exec_id not in self.results:
+            time.sleep(0.2)
+            if time.time() - start_time > timeout:
+                return {'result': f"扩展 {client_id} 在 {timeout}s 内无响应"}
+        result = self.results.pop(exec_id)
+        self.acks.pop(exec_id, None)
+        if not result['success']: raise Exception(result['data'])
+        return {'data': result['data']}
+
     def _remote_cmd(self, cmd, timeout=30):
         return self._http.post(self.remote, headers={"Content-Type": "application/json"}, json=cmd, timeout=timeout).json()
 
@@ -464,10 +530,17 @@ class TMWebDriver:
     def jump(self, url, timeout=10): self.execute_js(f"window.location.href={json.dumps(url)}", timeout=timeout)
     def newtab(self, url=None):
         if url is None: url = "http://www.baidu.com/robots.txt"
-        # Native chrome.tabs.create via the cmd channel (routed to the SW, not
-        # eval'd in a page). The old GM_openInTab was a Tampermonkey-only API
-        # absent from a plain extension, so it always threw ReferenceError.
-        return self.execute_js(json.dumps({"cmd": "tabs", "method": "create", "url": url}))
+        # Native chrome.tabs.create, addressed to the extension itself so it
+        # works with no tabs open. (The old GM_openInTab was a Tampermonkey-only
+        # API absent from a plain extension, so it always threw ReferenceError.)
+        payload = {"cmd": "tabs", "method": "create", "url": url}
+        try:
+            return self.ext_cmd(payload)
+        except Exception as e:
+            # Older bridge daemon without /link ext_cmd: fall back to the tab
+            # session route, which still works whenever at least one tab lives.
+            print(f"ext_cmd 不可用({e})，回退到 session 通道")
+            return self.execute_js(json.dumps(payload))
     
 if __name__ == "__main__":
     driver = TMWebDriver(host='127.0.0.1', port=18765)
