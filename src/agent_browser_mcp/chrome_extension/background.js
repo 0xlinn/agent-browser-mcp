@@ -353,11 +353,14 @@ async function handleBatch(msg, sender) {
 }
 
 async function handleCDP(msg, sender) {
-  // Debuggee accepts tabId OR extensionId. The extensionId branch targets an
-  // extension's background page and, per debugger_api.cc, skips the same-id
-  // check that ExtensionMayAttachToURL applies to chrome-extension:// tabs --
-  // so it can reach where a tab-based attach is refused. Needs a live
-  // background host, so MV3 workers that went idle simply have no target.
+  // Debuggee accepts tabId, extensionId or targetId. All three were measured
+  // against another extension; none can reach one:
+  //   tabId    -> "Cannot access a chrome-extension:// URL of different extension"
+  //   extensionId -> means the legacy MV2 background page only; every MV3
+  //                  extension lacks one, so "No background page with given id"
+  //   targetId -> same refusal as tabId, even for a target getTargets() lists
+  //               as attached=false. The check is at attach, not at lookup.
+  // Kept because targetId still addresses OUR own offscreen/worker targets.
   const target = msg.targetId ? { targetId: msg.targetId }
                : msg.extensionId ? { extensionId: msg.extensionId }
                                  : { tabId: msg.tabId || sender.tab?.id };
@@ -568,9 +571,15 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
 async function handleWsExec(data) {
   const tabId = data.tabId;
   console.log('[TMWD-WS] Exec request', data.id, 'on tab', tabId);
-  ws.send(JSON.stringify({ type: 'ack', id: data.id }));
+  // Same dead-socket hazard as onmessage, with a wider window: script exec plus
+  // the CDP fallback can run for seconds while the bridge restarts under us.
+  const sock = ws;
+  const send = (obj) => {
+    if (sock && sock.readyState === WebSocket.OPEN) sock.send(JSON.stringify(obj));
+  };
+  send({ type: 'ack', id: data.id });
   if (!tabId) {
-    ws.send(JSON.stringify({ type: 'error', id: data.id, error: 'No tabId provided' }));
+    send({ type: 'error', id: data.id, error: 'No tabId provided' });
     return;
   }
   // Use onCreated listener to reliably capture new tabs (avoids race condition with query-diff)
@@ -625,13 +634,13 @@ async function handleWsExec(data) {
       try { const t = await chrome.tabs.get(id); newTabs.push({id: t.id, url: t.url, title: t.title}); } catch (_) {}
     }
     if (res?.ok) {
-      ws.send(JSON.stringify({ type: 'result', id: data.id, result: res.data, newTabs }));
+      send({ type: 'result', id: data.id, result: res.data, newTabs });
     } else {
       console.log(res);
-      ws.send(JSON.stringify({ type: 'error', id: data.id, error: res?.error || 'Unknown error', newTabs }));
+      send({ type: 'error', id: data.id, error: res?.error || 'Unknown error', newTabs });
     }
   } catch (e) {
-    ws.send(JSON.stringify({ type: 'error', id: data.id, error: { name: e.name || 'Error', message: e.message || String(e), stack: e.stack || '' } }));
+    send({ type: 'error', id: data.id, error: { name: e.name || 'Error', message: e.message || String(e), stack: e.stack || '' } });
   } finally {
     chrome.tabs.onCreated.removeListener(onCreated);
   }
@@ -661,9 +670,11 @@ function connectWS() {
     lastPongAt = Date.now();
     scheduleKeepalive(); // Keep SW alive while connected
     try {
+      const sock = ws;
       const clientId = await getClientId();
       const tabs = (await chrome.tabs.query({})).filter(t => isScriptable(t.url));
-      ws.send(JSON.stringify({
+      if (!sock || sock.readyState !== WebSocket.OPEN) return; // died during await
+      sock.send(JSON.stringify({
         type: 'ext_ready',
         clientId,
         browser: getBrowserType(),
@@ -675,6 +686,14 @@ function connectWS() {
     }
   };
   ws.onmessage = async (event) => {
+    // This handler awaits, and the bridge can die mid-await: onclose nulls the
+    // global `ws`, so a later send() would throw DOMException on a dead socket.
+    // Capture the socket we arrived on and only answer if it's still open --
+    // the reply is worthless anyway once the bridge is gone.
+    const sock = ws;
+    const reply = (obj) => {
+      if (sock && sock.readyState === WebSocket.OPEN) sock.send(JSON.stringify(obj));
+    };
     try {
       const data = JSON.parse(event.data);
       if (data.type === 'pong') { lastPongAt = Date.now(); return; }
@@ -688,7 +707,7 @@ function connectWS() {
           // Custom protocol message → route to handleExtMessage
           if (code.tabId === undefined && data.tabId !== undefined) code.tabId = data.tabId;
           const res = await handleExtMessage(code, {});
-          ws.send(JSON.stringify({ type: res.ok ? 'result' : 'error', id: data.id, result: res.data ?? res.results ?? res, error: res.error }));
+          reply({ type: res.ok ? 'result' : 'error', id: data.id, result: res.data ?? res.results ?? res, error: res.error });
         } else if (typeof code === 'string') {
           // Plain JS code
           await handleWsExec(data);
@@ -696,11 +715,16 @@ function connectWS() {
           // Object without cmd → legacy extension message
           const msg = code.tabId === undefined && data.tabId !== undefined ? { ...code, tabId: data.tabId } : code;
           const res = await handleExtMessage(msg, {});
-          ws.send(JSON.stringify({ type: res.ok ? 'result' : 'error', id: data.id, result: res.data ?? res.results ?? res, error: res.error }));
+          reply({ type: res.ok ? 'result' : 'error', id: data.id, result: res.data ?? res.results ?? res, error: res.error });
         }
       }
     } catch (e) {
-      console.error('[TMWD-WS] message parse error', e);
+      // Name the two cases apart: a dead socket is benign (bridge restarted),
+      // a real parse failure is not. The old wording blamed parsing for both.
+      const dead = !sock || sock.readyState !== WebSocket.OPEN;
+      console[dead ? 'log' : 'error'](
+        dead ? '[TMWD-WS] bridge went away mid-request, reply dropped'
+             : '[TMWD-WS] message handling error', e);
     }
   };
   ws.onclose = () => {
@@ -759,10 +783,14 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 async function sendTabsUpdate() {
   ensureConnected('tabs-event');
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  // The check above goes stale across these awaits, so re-check the SAME socket
+  // right before sending rather than trusting the earlier readyState.
+  const sock = ws;
   const tabs = (await chrome.tabs.query({})).filter(t => isScriptable(t.url) && !/streamlit/i.test(t.title));
   try {
     const clientId = await getClientId();
-    ws.send(JSON.stringify({
+    if (!sock || sock.readyState !== WebSocket.OPEN) return;
+    sock.send(JSON.stringify({
       type: 'tabs_update',
       clientId,
       browser: getBrowserType(),
