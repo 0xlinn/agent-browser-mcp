@@ -72,6 +72,16 @@ async function handleExtMessage(msg, sender) {
       }
     } catch (e) { return { ok: false, error: e.message }; }
   }
+  if (msg.cmd === 'debugger_targets') {
+    // Ground truth for what CDP can actually attach to, including
+    // service_worker/other targets that chrome.tabs.query never reports.
+    try {
+      const t = await chrome.debugger.getTargets();
+      return { ok: true, data: t.map(x => ({ type: x.type, title: (x.title || '').slice(0, 40),
+        url: (x.url || '').slice(0, 80), attached: x.attached, id: x.id, tabId: x.tabId,
+        extensionId: x.extensionId })) };
+    } catch (e) { return { ok: false, error: e.message }; }
+  }
   if (msg.cmd === 'management') {
     try {
       if (msg.method === 'list') {
@@ -343,15 +353,24 @@ async function handleBatch(msg, sender) {
 }
 
 async function handleCDP(msg, sender) {
-  const tabId = msg.tabId || sender.tab?.id;
-  if (!tabId) return { ok: false, error: 'no tabId' };
+  // Debuggee accepts tabId OR extensionId. The extensionId branch targets an
+  // extension's background page and, per debugger_api.cc, skips the same-id
+  // check that ExtensionMayAttachToURL applies to chrome-extension:// tabs --
+  // so it can reach where a tab-based attach is refused. Needs a live
+  // background host, so MV3 workers that went idle simply have no target.
+  const target = msg.targetId ? { targetId: msg.targetId }
+               : msg.extensionId ? { extensionId: msg.extensionId }
+                                 : { tabId: msg.tabId || sender.tab?.id };
+  if (!target.targetId && !target.extensionId && !target.tabId) {
+    return { ok: false, error: 'no tabId, extensionId or targetId' };
+  }
   try {
-    await chrome.debugger.attach({ tabId }, '1.3');
-    const result = await chrome.debugger.sendCommand({ tabId }, msg.method, msg.params || {});
-    await chrome.debugger.detach({ tabId });
+    await chrome.debugger.attach(target, '1.3');
+    const result = await chrome.debugger.sendCommand(target, msg.method, msg.params || {});
+    await chrome.debugger.detach(target);
     return { ok: true, data: result };
   } catch (e) {
-    try { await chrome.debugger.detach({ tabId }); } catch (_) {}
+    try { await chrome.debugger.detach(target); } catch (_) {}
     return { ok: false, error: e.message };
   }
 }

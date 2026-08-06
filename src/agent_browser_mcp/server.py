@@ -457,12 +457,41 @@ def cdp_command(
     params_json: str = "{}",
     session_id: Optional[str] = None,
     tab_id: Optional[int] = None,
+    extension_id: Optional[str] = None,
+    target_id: Optional[str] = None,
 ) -> dict[str, Any]:
     params = json.loads(params_json or "{}")
     payload: dict[str, Any] = {"cmd": "cdp", "method": method, "params": params}
     if tab_id is not None:
         payload["tabId"] = tab_id
+    if extension_id is not None or target_id is not None:
+        # Non-tab debuggee. Routed via ext_cmd so it works with no tabs open.
+        # NOTE both forms are refused for OTHER extensions unless Chrome runs
+        # with --silent-debugger-extension-api: extensionId reports "No
+        # background page with given id", targetId hits the same-extension URL
+        # check. Useful for this extension's own targets and for diagnosis.
+        if extension_id is not None:
+            payload["extensionId"] = extension_id
+        if target_id is not None:
+            payload["targetId"] = target_id
+        driver = require_driver()
+        client_id = (str(session_id).rsplit(":", 1)[0]
+                     if session_id and ":" in str(session_id) else None)
+        return driver.ext_cmd(payload, client_id=client_id, timeout=20.0)
     return exec_js(json.dumps(payload), session_id=session_id, timeout=20.0)
+
+
+@mcp.tool(
+    description=(
+        "List every CDP-attachable target, including service workers and extension "
+        "background pages that list_tabs never shows. Works with no tabs open."
+    )
+)
+def debugger_targets(session_id: Optional[str] = None) -> dict[str, Any]:
+    driver = require_driver()
+    client_id = (str(session_id).rsplit(":", 1)[0]
+                 if session_id and ":" in str(session_id) else None)
+    return driver.ext_cmd({"cmd": "debugger_targets"}, client_id=client_id, timeout=20.0)
 
 
 @mcp.tool(description="Run a CDP bridge batch command; pass the full JSON command object as text.")
