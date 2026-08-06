@@ -354,10 +354,33 @@ def extension_path() -> dict[str, Any]:
     }
 
 
-@mcp.tool(description="List Chrome extensions visible to the CDP bridge extension itself.")
+@mcp.tool(description="List installed browser extensions (id, name, enabled, type, version). Works with no tabs open.")
 def list_extensions(session_id: Optional[str] = None) -> dict[str, Any]:
-    return exec_js(json.dumps({"cmd": "management", "method": "list"}),
-                   session_id=session_id, timeout=20.0)
+    # Addressed to the extension itself, so this answers even with zero tabs;
+    # session_id only picks which browser when several are connected.
+    driver = require_driver()
+    client_id = (str(session_id).rsplit(":", 1)[0]
+                 if session_id and ":" in str(session_id) else None)
+    return driver.ext_cmd({"cmd": "management", "method": "list"},
+                          client_id=client_id, timeout=20.0)
+
+
+@mcp.tool(
+    description=(
+        "Enable or disable an installed extension by id. Chrome exposes no API to INSTALL "
+        "an extension, so this only toggles ones already present; use list_extensions for ids."
+    )
+)
+def set_extension_enabled(extension_id: str, enabled: bool,
+                          session_id: Optional[str] = None) -> dict[str, Any]:
+    driver = require_driver()
+    client_id = (str(session_id).rsplit(":", 1)[0]
+                 if session_id and ":" in str(session_id) else None)
+    result = driver.ext_cmd(
+        {"cmd": "management", "method": "enable" if enabled else "disable",
+         "extId": extension_id},
+        client_id=client_id, timeout=20.0)
+    return {"status": "ok", "extension_id": extension_id, "enabled": enabled, "result": result}
 
 
 @mcp.tool(description="Read the current page as simplified HTML/text, preserving login state from the real browser.")
