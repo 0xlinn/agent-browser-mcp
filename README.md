@@ -1,274 +1,56 @@
+<!-- mcp-name: io.github.noxenys/agent-browser-mcp -->
+
 # agent-browser-mcp
 
-让你的 Agent 直接操作“你正在使用的真实 Chrome”的 MCP 服务。
+English | [中文文档](README.zh-CN.md)
 
-仓库地址：https://github.com/noxenys/agent-browser-mcp
+A Model Context Protocol (MCP) server that drives **the real Chrome you are already using**, through a Chrome extension and the Chrome DevTools Protocol. Your agent works inside your existing browser session, so logins, cookies, and open tabs are all already there — no separate sandbox browser to authenticate again.
 
-它不是沙盒浏览器，也不是简单网页抓取器，而是连接你本机已经打开的 Chrome，会保留：
-- 登录状态
-- Cookies
-- 已打开标签页
-- 真实页面上下文
+It also reaches past the page: real mouse and keyboard input at the OS level, for the cases where page-level JavaScript is not enough.
 
-适合这样的场景：
-- 让 Agent 直接读取你的小红书、后台系统、知识库、管理台页面
-- 对已经登录的网站做自动化，而不是重新登录一个无状态浏览器
-- 在普通浏览器自动化不稳定时，切换到 CDP / 真实鼠标键盘操作
-- 在一个 MCP 工具里同时拥有：页面扫描、JS 执行、CDP 控制、截图、物理输入
+## Key features
 
-一句话概括：
-> 这是一个把“真实浏览器自动化”包装成标准 MCP 的项目，让 Agent 不再只会操作沙盒浏览器，而能真正进入你的日常浏览器工作流。
+- **Real browser, real session** — attaches to your running Chrome/Edge/Opera. Logged-in sites, cookies, and page context are preserved.
+- **Page reading** — scan any page into simplified HTML or text, sized for a model's context.
+- **JavaScript execution** — run arbitrary JS in the page.
+- **Native CDP access** — single commands or batches. Addressable by tab, extension id, or target id.
+- **Tab-less operation** — extension management, CDP target listing, and tab listing/closing go straight to the extension's service worker, so they work even with zero tabs open.
+- **Screenshots** — page capture via CDP, plus full desktop capture.
+- **Real physical input** — OS-level mouse move/click/drag, typing, and hotkeys.
+- **Multi-browser** — Chrome, Edge, and Opera can all connect to one bridge at the same time without clobbering each other's sessions.
 
-## 核心能力一览
+## Requirements
 
-- 真实 Chrome 标签页发现、切换与关闭
-- 页面扫描与简化内容提取
-- 页面内 JavaScript 执行
-- 原生 CDP 单命令 / 批量调用，可寻址 service worker 等非标签页目标
-- 扩展列举与启用/禁用（零标签页可用）
-- 页面截图 / 桌面截图
-- Cookies 读取
-- 鼠标移动、点击、拖拽
-- 键盘输入与热键
-
-这是一个标准 MCP 服务，不绑定任何特定客户端。Claude Code、Claude Desktop、Cursor、Hermes 等都能直接接入。
-
-## 这个 MCP 能做什么
-
-这个项目把真实浏览器自动化能力包装成了标准 MCP 工具，重点能力包括：
-
-### 1. 浏览器标签页与导航
-- 查看当前已连接的真实标签页（每个标签带 `browser` 字段，区分 chrome / edge）
-- 切换到指定标签页（可按 session id、URL 关键字，或浏览器名 `chrome`/`edge` 选择）
-- 在当前标签页打开 URL
-- 新建标签页
-- 列出**全部**标签页，含 `chrome-extension://` 页面（这类页面跑不了内容脚本，因此没有 session id，普通列表里看不到）
-- 按原生 tab id 关闭标签页，可传单个 id 或一组 id
-
-> 支持 Chrome 与 Edge 同时连接：两个浏览器都加载扩展后各自独立成会话，互不覆盖。
-> 用 `switch_tab(browser="edge")` 或 `switch_tab(browser="chrome")` 指定目标浏览器。
-
-### 2. 页面读取
-- 扫描当前页面内容
-- 提取简化后的 HTML / 文本
-- 适合读取信息流、帖子列表、搜索结果页
-
-### 3. 页面执行与 CDP 控制
-- 在页面中执行任意 JavaScript
-- 直接调用 Chrome DevTools Protocol（CDP）
-- 支持单条命令和批量命令
-- 可用于截图、DOM 查询、点击、文件上传等更复杂操作
-- 列出所有可 attach 的 CDP 目标，包括 service worker 和扩展背景页——这些是标签页列表里永远看不到的
-- CDP 除了按 `tab_id` 寻址，也接受 `extension_id` / `target_id`，因此无标签页时同样可用
-
-> 关于操作**其他**扩展：Chrome 会在 attach 那一层拒绝跨扩展调试，`tab_id`、`extension_id`、`target_id` 三种寻址方式都一样被拒（除非 Chrome 带 `--silent-debugger-extension-api` 启动）。这些参数的用处是操作本扩展自己的目标，以及做故障诊断。
-
-### 3.1 扩展管理
-- 列出已安装的浏览器扩展（id、名称、启用状态、类型、版本）
-- 按 id 启用 / 禁用某个扩展
-
-> Chrome 没有任何 API 可以**安装**扩展，所以这里只能开关已存在的扩展。
-> 这两个能力直接发给扩展的 service worker，**零标签页也能用**。
-
-### 4. 截图能力
-- 页面截图（通过 CDP）
-- 桌面截图（用于辅助真实桌面操作）
-
-### 5. 真实物理输入
-- 鼠标移动
-- 鼠标点击
-- 鼠标拖拽
-- 键盘输入
-- 热键发送
-
-这类能力很适合处理：
-- 必须保留登录态的网站
-- 普通浏览器自动化工具容易被风控的网站
-- 必须使用真实点击 / 真实键盘输入的场景
-- 需要读取复杂页面结构的场景
-
-## 适合哪些场景
-
-例如：
-- 读取你当前小红书首页推荐流
-- 在真实浏览器里打开后台页面并抓取信息
-- 调用 CDP 截图页面
-- 在页面 JS 不够用时，回退到真实鼠标/键盘操作
-- 让 Agent 直接操作你已登录的网站，而不是重新登录一个无状态浏览器
-
-## 工作原理
-
-项目由三层组成：
-
-1. Chrome 扩展
-- 注入到真实网页
-- 通过 Chrome API 访问 tabs / cookies / debugger / management
-- 与本地桥接服务通信
-
-2. TMWebDriver 本地桥接
-- 默认监听：
-  - WebSocket: `127.0.0.1:18765`
-  - HTTP: `127.0.0.1:18766`
-- 负责连接扩展、维护会话、转发执行结果
-- Chrome 和 Edge 可同时连同一个桥：每个浏览器上报自己的 `clientId` + `browser`，会话按 `clientId:tabId` 命名，互不覆盖、互不断开
-- 除了走标签页的会话通道，还有一条直连扩展 service worker 的通道。标签页全关时会话通道就断了，而扩展管理、`debugger_targets`、`list_all_tabs`、`close_tabs` 走的是后者，所以**零标签页也能用**
-- 桥以独立进程后台运行，生命周期和 MCP 实例解耦；缺失时由 MCP 服务自动拉起，无窗口弹出
-
-3. MCP 服务
-- 把浏览器能力暴露为 MCP tools
-- 供 Claude Code、Claude Desktop、Cursor、Hermes 等客户端直接调用
-
-## 主要工具
-
-当前暴露的主要 MCP 工具包括：
-
-### 浏览器/标签页
-- `get_setup_status`
-- `list_tabs`
-- `list_all_tabs` — 含 `chrome-extension://` 页面，零标签页可用
-- `close_tabs` — 按原生 tab id 关闭，支持批量
-- `switch_tab`
-- `open_url`
-- `open_new_tab`
-
-### 扩展管理
-- `extension_path`
-- `list_extensions` — 零标签页可用
-- `set_extension_enabled` — 启用/禁用已安装的扩展
-
-### 页面读取/执行
-- `scan_page`
-- `execute_js`
-
-### CDP 与截图
-- `cdp_command` — 支持 `tab_id` / `extension_id` / `target_id` 寻址
-- `debugger_targets` — 列出全部可 attach 目标，含 service worker，零标签页可用
-- `cdp_batch`
-- `get_cookies`
-- `capture_page_screenshot`
-- `capture_desktop_screenshot`
-
-### 物理输入
-- `mouse_move`
-- `mouse_click`
-- `mouse_drag`
-- `type_text`
-- `hotkey`
-- `pointer_info`
-
-## 安装要求
-
-推荐环境：
-- macOS 或 Windows
 - Python 3.10+
-- Google Chrome
-- 任意支持 MCP 的客户端，例如：
-  - Claude Code
-  - Claude Desktop
-  - Cursor
-  - Hermes Agent
+- Chrome, Edge, or Opera
+- macOS or Windows
+- Claude Code, or any other MCP client
 
-## 安装
+## Getting started
 
-在本地克隆后执行：
+### 1. Install
 
 ```bash
-cd agent-browser-mcp
 pip install -e .
 ```
 
-如果你想先构建 wheel 再安装：
+### 2. Load the Chrome extension
 
-```bash
-python -m pip install --upgrade build
-python -m build
-pip install dist/agent_browser_mcp-0.1.0-py3-none-any.whl
-```
-
-## 命令行工具
-
-安装后会提供一个 CLI：
-
-```bash
-agent-browser-mcp
-```
-
-它有几个常用子命令：
-
-### 输出 Chrome 扩展目录
+This project ships an unpacked extension that has to be loaded once by hand.
 
 ```bash
 agent-browser-mcp extension-path
 ```
 
-### 输出 Hermes 配置片段
+Open `chrome://extensions`, turn on **Developer mode**, click **Load unpacked**, and pick the directory that command printed.
 
-```bash
-agent-browser-mcp print-hermes-config
-```
+If you also use Edge or Opera, repeat the same steps at `edge://extensions` or `opera://extensions` with the same directory. The bridge tells the browsers apart automatically.
 
-仅在用 Hermes 时需要；其他客户端见下面的「客户端配置」。
+Then open a normal `http://` or `https://` page. A blank tab is not enough — content scripts cannot run on `about:blank`, so no session is established.
 
-### 环境诊断
+### 3. Add the server to your client
 
-```bash
-agent-browser-mcp doctor
-```
-
-这个命令会输出 JSON，帮助你检查：
-- 扩展目录位置
-- `config.js` 是否生成
-- 端口状态
-- 当前连接到的标签页数量
-
-并给出一个结构化诊断：`cause` 是故障判定（如 `healthy` / `ext_never_registered` / `sw_slept_or_dropped` / `bridge_unreachable`），`advice` 是对应的一句话修复建议——不用再手动 netstat + curl 逐层排查。
-
-## Chrome 扩展安装
-
-这个项目包含一个 unpacked Chrome 扩展，需要手动加载一次。
-
-### 第一步：获取扩展目录
-
-```bash
-agent-browser-mcp extension-path
-```
-
-### 第二步：在 Chrome 中加载
-
-打开：
-
-```text
-chrome://extensions
-```
-
-然后：
-- 打开“开发者模式”
-- 点击“加载已解压的扩展程序”
-- 选择上一步输出的目录
-
-如果你也用 Edge，在 `edge://extensions` 里重复同样的步骤加载同一个目录即可。桥会自动区分 Chrome 与 Edge（以及同一浏览器的多个 profile），两边可以同时连接、互不干扰。用 `switch_tab(browser="edge")` 或 `switch_tab(browser="chrome")` 指定目标浏览器。
-
-### 第三步：打开正常网页
-
-注意不要停留在 `about:blank`。
-
-请在 Chrome 中打开一个正常网页，例如：
-- `https://www.baidu.com`
-- `https://www.xiaohongshu.com`
-
-否则不会建立有效会话。
-
-## 客户端配置
-
-这是标准 MCP 服务，所有客户端的配置本质都一样：把 `agent-browser-mcp` 这个命令注册成一个 stdio MCP server。
-
-### Claude Code
-
-```bash
-claude mcp add agent-browser-mcp -- agent-browser-mcp
-```
-
-或者直接写进 `~/.claude.json`：
+**Standard config** works in most tools:
 
 ```json
 {
@@ -281,36 +63,50 @@ claude mcp add agent-browser-mcp -- agent-browser-mcp
 }
 ```
 
-如果装在虚拟环境里，`command` 填可执行文件的绝对路径更稳，避免 PATH 里找不到：
+If you installed into a virtualenv, point `command` at the executable's absolute path instead — relying on `PATH` is the most common reason a client fails to start the server.
 
-```json
-"command": "D:\\venvs\\agent-browser-mcp\\Scripts\\agent-browser-mcp.exe"
+<details>
+<summary>Claude Code</summary>
+
+```bash
+claude mcp add agent-browser-mcp -- agent-browser-mcp
 ```
 
-配置后重启 Claude Code，用 `/mcp` 确认服务已连接。
+Add `--scope user` to make it available across all projects. For a virtualenv install:
 
-### Claude Desktop / Cursor
-
-仓库里放了示例：
-- `examples/claude-desktop-config.json`
-- `examples/cursor-mcp.json`
-
-核心就是：
-
-```json
-{
-  "mcpServers": {
-    "agent_browser": {
-      "command": "agent-browser-mcp",
-      "args": []
-    }
-  }
-}
+```bash
+claude mcp add agent-browser-mcp -- /path/to/venv/bin/agent-browser-mcp
 ```
 
-### Hermes
+Verify with `/mcp`.
+</details>
 
-把下面这段加到 `~/.hermes/config.yaml`：
+<details>
+<summary>Claude Desktop</summary>
+
+Follow the MCP install [guide](https://modelcontextprotocol.io/quickstart/user) and use the standard config above. An example file is included at `examples/claude-desktop-config.json`.
+</details>
+
+<details>
+<summary>Cursor</summary>
+
+Put the standard config in `.cursor/mcp.json` for one project, or `~/.cursor/mcp.json` globally. An example file is included at `examples/cursor-mcp.json`.
+</details>
+
+<details>
+<summary>VS Code</summary>
+
+```bash
+code --add-mcp '{"name":"agent-browser-mcp","command":"agent-browser-mcp"}'
+```
+
+Or write it into `.vscode/mcp.json` by hand — note that VS Code's key is `servers`, not `mcpServers`.
+</details>
+
+<details>
+<summary>Hermes</summary>
+
+Add to `~/.hermes/config.yaml`:
 
 ```yaml
 mcp_servers:
@@ -320,95 +116,165 @@ mcp_servers:
     connect_timeout: 60
 ```
 
-示例文件：`examples/hermes-config.yaml`。也可以用 `agent-browser-mcp print-hermes-config` 直接打印这段。
+`agent-browser-mcp print-hermes-config` prints this snippet. An example file is included at `examples/hermes-config.yaml`. Verify with `hermes mcp list`.
+</details>
 
-配置后重启 Hermes，用 `hermes mcp list` 和 `hermes mcp test agent_browser` 验证。
+<details>
+<summary>Other clients</summary>
 
-## 典型使用流程
+Any MCP client that speaks stdio will work. Follow its own install guide and use the standard config above.
+</details>
 
-1. 安装 Python 包
-2. 在 Chrome 中加载扩展
-3. 打开一个真实网页
-4. 在 MCP 客户端中接入这个服务
-5. 开始调用浏览器工具
+### Your first prompt
 
-例如，Agent 可以做：
-- 打开小红书首页
-- 读取推荐流
-- 扫描帖子列表
-- 对页面进行 CDP 截图
-- 在必要时执行真实鼠标/键盘操作
+Once the extension is loaded and a normal page is open, try:
 
-## 安全提醒
+> What tabs do I have open? Read the current page and summarise it.
 
-这个项目操作的是你的真实浏览器和真实桌面。
+If tabs come back empty, run `agent-browser-mcp doctor`.
 
-这意味着：
-- 鼠标移动是真的
-- 点击是真的
-- 输入是真的
-- 热键是真的
-- 浏览器里的登录态也是真的
+## Configuration
 
-请只在你信任的 MCP 客户端和 Agent 环境中使用。
+### Environment variables
 
-## 常见问题
+| Variable | Default | Purpose |
+|---|---|---|
+| `AGENT_BROWSER_TMWD_HOST` | `127.0.0.1` | Bridge bind address. |
+| `AGENT_BROWSER_TMWD_PORT` | `18765` | WebSocket port. HTTP uses `PORT+1`, and `PORT+2` is a lock socket that keeps exactly one bridge hosting. |
+| `AGENT_BROWSER_NO_SPAWN` | unset | Set to `1` to stop the MCP server from auto-starting the bridge. Use it when you run the bridge yourself. |
+| `AGENT_BROWSER_PREFERRED_BROWSER` | unset | `chrome`, `edge`, or `opera`. Which browser wins when several are connected and no tab is specified. |
 
-### 1. 客户端能看到 MCP 服务，但没有连接到任何标签页
-
-请检查：
-- 扩展是否已经在 `chrome://extensions` 中加载
-- Chrome 里是否打开了正常网页
-- 是否只是停留在 `about:blank`
-
-你也可以运行：
+### CLI
 
 ```bash
-agent-browser-mcp doctor
+agent-browser-mcp                      # run the MCP server (stdio)
+agent-browser-mcp extension-path       # print the unpacked extension directory
+agent-browser-mcp doctor               # diagnose the local setup, as JSON
+agent-browser-mcp bridge               # run the bridge in the foreground
+agent-browser-mcp print-hermes-config  # print a Hermes config snippet
 ```
 
-### 2. `connected_tabs` 为 0
+`doctor` reports the extension path, whether `config.js` was generated, port state, and connected tab count. It also returns a structured verdict: `cause` is one of `healthy`, `ext_never_registered`, `sw_slept_or_dropped`, or `bridge_unreachable`, and `advice` is the matching one-line fix — no manual `netstat` and `curl` archaeology.
 
-通常是以下原因之一：
-- 扩展没有加载成功
-- 当前没有正常网页
-- 扩展刚重载，页面还没刷新
+## How it works
 
-建议：
-- 刷新当前网页
-- 新开一个正常 URL
-- 再运行一次 `doctor`
+Three layers:
 
-### 3. 物理输入在 macOS 上不生效
+1. **Chrome extension** (MV3) — injected into real pages, reaches `tabs`, `cookies`, `debugger`, and `management` through Chrome APIs.
+2. **TMWebDriver bridge** — a local daemon on `127.0.0.1:18765` (WebSocket) and `:18766` (HTTP). It owns the extension connections, tracks sessions, and relays results. It runs detached from any MCP instance, and the MCP server starts it on demand with no console window. Sessions are keyed `clientId:tabId`, so several browsers and profiles coexist.
+3. **MCP server** — exposes the whole thing as MCP tools.
 
-请给终端 / MCP 客户端授予系统权限：
-- 辅助功能（Accessibility）
-- 屏幕录制（如果你需要桌面截图）
+Two channels reach the browser: a per-tab session channel, and a direct channel to the extension's service worker. The second one is why some tools keep working when every tab is closed.
 
-### 4. 客户端连不上这个 MCP 服务
+## Disclaimers
 
-请检查：
-- 包是否安装成功
-- `agent-browser-mcp` 是否在 PATH 中；装在虚拟环境里的话，配置里直接填绝对路径
-- 客户端的 MCP 配置是否正确（Claude Code 用 `/mcp` 看，Hermes 用 `hermes mcp test agent_browser`）
-- 运行 `agent-browser-mcp doctor` 看诊断输出
+This server drives your real browser and your real desktop. Anything it can do, you can do — and it inherits every session you are logged into.
 
-## 致谢
+- Mouse moves, clicks, typing, and hotkeys are real OS-level input, not synthetic page events.
+- Page content is untrusted input. A page your agent reads can attempt prompt injection, and the tools available make that consequential.
+- This is **not** a security boundary. See [MCP Security Best Practices](https://modelcontextprotocol.io/docs/tutorials/security/security_best_practices).
+- Avoid pointing it at sensitive accounts you would not want an MCP client to see, and prefer not to run it on shared or production machines.
 
-这个项目的浏览器自动化能力，是从 GenericAgent 的浏览器栈中提取并重新封装成 MCP 服务的。
+The extension requests broad permissions because the feature set requires them: `cookies`, `tabs`, `activeTab`, `debugger`, `scripting`, `alarms`, `storage`, `declarativeNetRequest`, `management`, `bookmarks`, and `<all_urls>`.
 
-特别感谢 GenericAgent 项目及其作者提供的原始实现思路与核心能力来源。
+## Tools
 
-原项目地址：
-- https://github.com/lsdefine/GenericAgent
+Most tools accept an optional `session_id` to target one specific tab; omitting it uses the active tab. Tools marked **no tab needed** talk to the extension's service worker and work with zero tabs open.
 
-本项目中以下部分来自或改编自 GenericAgent：
+<details>
+<summary><b>Tabs and navigation</b></summary>
+
+- **get_setup_status** — extension path, ports, connected tabs, and the active session. No parameters.
+- **list_tabs** — list connected tabs. Each carries a `browser` field. No parameters.
+- **list_all_tabs** — *(no tab needed)* list every open tab, including `chrome-extension://` pages that `list_tabs` hides. Those never become sessions, so they have no session id; drive them with `cdp_command(tab_id=...)`.
+  - `session_id` (string, optional): which browser to ask.
+- **switch_tab** — set the active tab.
+  - `session_id` (string, optional), `url_pattern` (string, optional): substring match, `browser` (string, optional): `chrome`, `edge`, or `opera`.
+- **open_url** — navigate the current tab.
+  - `url` (string), `session_id` (string, optional), `timeout` (number, optional)
+- **open_new_tab** — open a new tab.
+  - `url` (string)
+- **close_tabs** — *(no tab needed)* close tabs by **native tab id**, not session id. Works on `chrome-extension://` pages, which no session-scoped path can reach.
+  - `tab_id` (integer or array of integers), `session_id` (string, optional)
+</details>
+
+<details>
+<summary><b>Page reading and execution</b></summary>
+
+- **scan_page** — read the page as simplified HTML or text.
+  - `session_id` (string, optional), `text_only` (boolean, optional), `cutlist` (boolean, optional): collapse repetitive lists, `maxchars` (integer, optional), `instruction` (string, optional), `extra_js` (string, optional), `timeout` (number, optional)
+- **execute_js** — run JavaScript in the page and return the result.
+  - `script` (string), `session_id` (string, optional), `no_monitor` (boolean, optional), `timeout` (number, optional)
+- **get_cookies** — read cookies for a page.
+  - `session_id` (string, optional), `tab_id` (integer, optional)
+</details>
+
+<details>
+<summary><b>CDP</b></summary>
+
+- **cdp_command** — send one CDP command.
+  - `method` (string): e.g. `Page.navigate`, `params_json` (string, optional): JSON object as text, `session_id` (string, optional), `tab_id` (integer, optional), `extension_id` (string, optional), `target_id` (string, optional)
+- **cdp_batch** — send a batch; `batch_json` must be a JSON object with `cmd: "batch"`.
+  - `batch_json` (string), `session_id` (string, optional)
+- **debugger_targets** — *(no tab needed)* list every CDP-attachable target, including service workers and extension background pages that `list_tabs` never shows.
+  - `session_id` (string, optional)
+
+> **On driving *other* extensions:** Chrome refuses cross-extension debugging at attach time, and all three addressing forms (`tab_id`, `extension_id`, `target_id`) are rejected alike unless Chrome was started with `--silent-debugger-extension-api`. These parameters are for this extension's own targets and for diagnosis.
+</details>
+
+<details>
+<summary><b>Extension management</b></summary>
+
+- **extension_path** — absolute path of the unpacked extension, for manual install. No parameters.
+- **list_extensions** — *(no tab needed)* installed extensions with id, name, enabled state, type, and version.
+  - `session_id` (string, optional)
+- **set_extension_enabled** — *(no tab needed)* enable or disable an installed extension. Chrome exposes no API to *install* one, so this only toggles what is already there.
+  - `extension_id` (string), `enabled` (boolean), `session_id` (string, optional)
+</details>
+
+<details>
+<summary><b>Screenshots</b></summary>
+
+- **capture_page_screenshot** — page capture via CDP.
+  - `session_id` (string, optional), `tab_id` (integer, optional), `format` (string, optional), `save_path` (string, optional), `return_base64` (boolean, optional)
+- **capture_desktop_screenshot** — whole-screen capture, for verifying physical input.
+  - `save_path` (string, optional)
+</details>
+
+<details>
+<summary><b>Physical input</b></summary>
+
+Real OS-level input. It moves your actual cursor.
+
+- **mouse_move** — `x` (integer), `y` (integer), `duration` (number, optional)
+- **mouse_click** — `x` (integer, optional), `y` (integer, optional), `button` (string, optional), `clicks` (integer, optional), `interval` (number, optional)
+- **mouse_drag** — `x1` (integer), `y1` (integer), `x2` (integer), `y2` (integer), `duration` (number, optional), `button` (string, optional)
+- **type_text** — `text` (string), `interval` (number, optional), `click_x` (integer, optional), `click_y` (integer, optional)
+- **hotkey** — `keys_csv` (string): comma-separated, e.g. `ctrl,c`
+- **pointer_info** — current cursor position and screen size. No parameters.
+</details>
+
+## Troubleshooting
+
+**The client sees the server, but no tabs are connected.** Check that the extension is loaded, and that a normal `http`/`https` page is open rather than a blank tab. Then run `agent-browser-mcp doctor`.
+
+**`connected_tabs` is 0.** Usually the extension failed to load, there is no normal page open, or the extension was just reloaded and the page has not been refreshed. Refresh the page, or open a new URL, and run `doctor` again.
+
+**The client cannot start the server.** Confirm the package installed, and that `agent-browser-mcp` is on `PATH` — if it is in a virtualenv, use the absolute path in your config. Then check `doctor`.
+
+**Physical input does nothing on macOS.** Grant your terminal or MCP client Accessibility permission, plus Screen Recording if you need desktop capture.
+
+## Credits
+
+The browser automation core here was extracted from [GenericAgent](https://github.com/lsdefine/GenericAgent)'s browser stack and repackaged as an MCP server. Thanks to that project and its author for the original implementation.
+
+Derived from or adapted from GenericAgent:
 - `TMWebDriver.py`
 - `simphtml.py`
-- `tmwd_cdp_bridge` Chrome 扩展资源
+- the `tmwd_cdp_bridge` Chrome extension resources
 
-如果你基于本项目继续二次开发或发布，也建议保留对 GenericAgent 的致谢与来源说明。
+If you fork or redistribute this, please keep the attribution.
 
-## 许可证
+## License
 
 MIT
