@@ -314,6 +314,37 @@ def list_tabs() -> dict[str, Any]:
     }
 
 
+@mcp.tool(
+    description=(
+        "List every open tab, including chrome-extension:// pages that list_tabs hides. "
+        "Those never become sessions (content scripts can't run there), so they have no "
+        "session id — drive them with cdp_command(tab_id=...) instead. Works with no tabs open."
+    )
+)
+def list_all_tabs(session_id: Optional[str] = None) -> dict[str, Any]:
+    driver = require_driver()
+    client_id = (str(session_id).rsplit(":", 1)[0]
+                 if session_id and ":" in str(session_id) else None)
+    return driver.ext_cmd({"cmd": "tabs", "all": True},
+                          client_id=client_id, timeout=20.0)
+
+
+@mcp.tool(
+    description=(
+        "Close one or more tabs by native tab id (not session id). Accepts a single id or "
+        "a list. Works on chrome-extension:// pages, which no session-scoped path can reach."
+    )
+)
+def close_tabs(tab_id: int | list[int], session_id: Optional[str] = None) -> dict[str, Any]:
+    driver = require_driver()
+    client_id = (str(session_id).rsplit(":", 1)[0]
+                 if session_id and ":" in str(session_id) else None)
+    result = driver.ext_cmd({"cmd": "tabs", "method": "close", "tabId": tab_id},
+                            client_id=client_id, timeout=20.0)
+    invalidate_sessions_cache()
+    return {"status": "ok", "closed": tab_id, "result": result}
+
+
 @mcp.tool(description="Set the active browser tab by session id, URL substring, or browser name ('chrome'/'edge'/'opera').")
 def switch_tab(
     session_id: Optional[str] = None,

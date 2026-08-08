@@ -19,10 +19,11 @@
 
 ## 核心能力一览
 
-- 真实 Chrome 标签页发现与切换
+- 真实 Chrome 标签页发现、切换与关闭
 - 页面扫描与简化内容提取
 - 页面内 JavaScript 执行
-- 原生 CDP 单命令 / 批量调用
+- 原生 CDP 单命令 / 批量调用，可寻址 service worker 等非标签页目标
+- 扩展列举与启用/禁用（零标签页可用）
 - 页面截图 / 桌面截图
 - Cookies 读取
 - 鼠标移动、点击、拖拽
@@ -39,6 +40,8 @@
 - 切换到指定标签页（可按 session id、URL 关键字，或浏览器名 `chrome`/`edge` 选择）
 - 在当前标签页打开 URL
 - 新建标签页
+- 列出**全部**标签页，含 `chrome-extension://` 页面（这类页面跑不了内容脚本，因此没有 session id，普通列表里看不到）
+- 按原生 tab id 关闭标签页，可传单个 id 或一组 id
 
 > 支持 Chrome 与 Edge 同时连接：两个浏览器都加载扩展后各自独立成会话，互不覆盖。
 > 用 `switch_tab(browser="edge")` 或 `switch_tab(browser="chrome")` 指定目标浏览器。
@@ -53,6 +56,17 @@
 - 直接调用 Chrome DevTools Protocol（CDP）
 - 支持单条命令和批量命令
 - 可用于截图、DOM 查询、点击、文件上传等更复杂操作
+- 列出所有可 attach 的 CDP 目标，包括 service worker 和扩展背景页——这些是标签页列表里永远看不到的
+- CDP 除了按 `tab_id` 寻址，也接受 `extension_id` / `target_id`，因此无标签页时同样可用
+
+> 关于操作**其他**扩展：Chrome 会在 attach 那一层拒绝跨扩展调试，`tab_id`、`extension_id`、`target_id` 三种寻址方式都一样被拒（除非 Chrome 带 `--silent-debugger-extension-api` 启动）。这些参数的用处是操作本扩展自己的目标，以及做故障诊断。
+
+### 3.1 扩展管理
+- 列出已安装的浏览器扩展（id、名称、启用状态、类型、版本）
+- 按 id 启用 / 禁用某个扩展
+
+> Chrome 没有任何 API 可以**安装**扩展，所以这里只能开关已存在的扩展。
+> 这两个能力直接发给扩展的 service worker，**零标签页也能用**。
 
 ### 4. 截图能力
 - 页面截图（通过 CDP）
@@ -95,6 +109,8 @@
   - HTTP: `127.0.0.1:18766`
 - 负责连接扩展、维护会话、转发执行结果
 - Chrome 和 Edge 可同时连同一个桥：每个浏览器上报自己的 `clientId` + `browser`，会话按 `clientId:tabId` 命名，互不覆盖、互不断开
+- 除了走标签页的会话通道，还有一条直连扩展 service worker 的通道。标签页全关时会话通道就断了，而扩展管理、`debugger_targets`、`list_all_tabs`、`close_tabs` 走的是后者，所以**零标签页也能用**
+- 桥以独立进程后台运行，生命周期和 MCP 实例解耦；缺失时由 MCP 服务自动拉起，无窗口弹出
 
 3. MCP 服务
 - 把浏览器能力暴露为 MCP tools
@@ -107,18 +123,24 @@
 ### 浏览器/标签页
 - `get_setup_status`
 - `list_tabs`
+- `list_all_tabs` — 含 `chrome-extension://` 页面，零标签页可用
+- `close_tabs` — 按原生 tab id 关闭，支持批量
 - `switch_tab`
 - `open_url`
 - `open_new_tab`
+
+### 扩展管理
 - `extension_path`
-- `list_extensions`
+- `list_extensions` — 零标签页可用
+- `set_extension_enabled` — 启用/禁用已安装的扩展
 
 ### 页面读取/执行
 - `scan_page`
 - `execute_js`
 
 ### CDP 与截图
-- `cdp_command`
+- `cdp_command` — 支持 `tab_id` / `extension_id` / `target_id` 寻址
+- `debugger_targets` — 列出全部可 attach 目标，含 service worker，零标签页可用
 - `cdp_batch`
 - `get_cookies`
 - `capture_page_screenshot`
