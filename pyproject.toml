@@ -10,9 +10,9 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 authors = [
-  { name = "zhea" }
+  { name = "noxenys", email = "noxen.ys@gmail.com" }
 ]
-keywords = ["mcp", "browser automation", "chrome", "cdp", "tmwebdriver", "hermes"]
+keywords = ["mcp", "browser automation", "chrome", "cdp", "tmwebdriver", "claude-code"]
 classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
@@ -33,9 +33,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/335234131/agent-browser-mcp"
-Repository = "https://github.com/335234131/agent-browser-mcp"
-Issues = "https://github.com/335234131/agent-browser-mcp/issues"
+Homepage = "https://github.com/noxenys/agent-browser-mcp"
+Repository = "https://github.com/noxenys/agent-browser-mcp"
+Issues = "https://github.com/noxenys/agent-browser-mcp/issues"
 
 [project.scripts]
 agent-browser-mcp = "agent_browser_mcp.cli:main"

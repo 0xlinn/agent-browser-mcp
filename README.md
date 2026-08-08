@@ -2,6 +2,8 @@
 
 让你的 Agent 直接操作“你正在使用的真实 Chrome”的 MCP 服务。
 
+仓库地址：https://github.com/noxenys/agent-browser-mcp
+
 它不是沙盒浏览器，也不是简单网页抓取器，而是连接你本机已经打开的 Chrome，会保留：
 - 登录状态
 - Cookies
@@ -9,7 +11,7 @@
 - 真实页面上下文
 
 适合这样的场景：
-- 让 Hermes 直接读取你的小红书、后台系统、知识库、管理台页面
+- 让 Agent 直接读取你的小红书、后台系统、知识库、管理台页面
 - 对已经登录的网站做自动化，而不是重新登录一个无状态浏览器
 - 在普通浏览器自动化不稳定时，切换到 CDP / 真实鼠标键盘操作
 - 在一个 MCP 工具里同时拥有：页面扫描、JS 执行、CDP 控制、截图、物理输入
@@ -29,7 +31,7 @@
 - 鼠标移动、点击、拖拽
 - 键盘输入与热键
 
-如果你希望让 Hermes、Claude Desktop、Cursor 等 MCP 客户端直接操作你本机真实浏览器，这个项目就是为这个场景准备的。
+这是一个标准 MCP 服务，不绑定任何特定客户端。Claude Code、Claude Desktop、Cursor、Hermes 等都能直接接入。
 
 ## 这个 MCP 能做什么
 
@@ -88,7 +90,7 @@
 ## 适合哪些场景
 
 例如：
-- 用 Hermes 读取你当前小红书首页推荐流
+- 读取你当前小红书首页推荐流
 - 在真实浏览器里打开后台页面并抓取信息
 - 调用 CDP 截图页面
 - 在页面 JS 不够用时，回退到真实鼠标/键盘操作
@@ -114,7 +116,7 @@
 
 3. MCP 服务
 - 把浏览器能力暴露为 MCP tools
-- 供 Hermes、Claude Desktop、Cursor 等客户端直接调用
+- 供 Claude Code、Claude Desktop、Cursor、Hermes 等客户端直接调用
 
 ## 主要工具
 
@@ -161,9 +163,10 @@
 - Python 3.10+
 - Google Chrome
 - 任意支持 MCP 的客户端，例如：
-  - Hermes Agent
+  - Claude Code
   - Claude Desktop
   - Cursor
+  - Hermes Agent
 
 ## 安装
 
@@ -203,6 +206,8 @@ agent-browser-mcp extension-path
 ```bash
 agent-browser-mcp print-hermes-config
 ```
+
+仅在用 Hermes 时需要；其他客户端见下面的「客户端配置」。
 
 ### 环境诊断
 
@@ -253,39 +258,44 @@ chrome://extensions
 
 否则不会建立有效会话。
 
-## Hermes 配置
+## 客户端配置
 
-把下面这段加到 `~/.hermes/config.yaml`：
+这是标准 MCP 服务，所有客户端的配置本质都一样：把 `agent-browser-mcp` 这个命令注册成一个 stdio MCP server。
 
-```yaml
-mcp_servers:
-  agent_browser:
-    command: agent-browser-mcp
-    timeout: 120
-    connect_timeout: 60
-```
-
-项目里也附带了示例文件：
-- `examples/hermes-config.yaml`
-
-配置后，重启 Hermes 或重新加载 MCP。
-
-可用下面的命令验证：
+### Claude Code
 
 ```bash
-hermes mcp list
-hermes mcp test agent_browser
+claude mcp add agent-browser-mcp -- agent-browser-mcp
 ```
 
-如果测试成功，Hermes 就能发现并调用这些浏览器工具。
+或者直接写进 `~/.claude.json`：
 
-## Claude Desktop / Cursor 配置
+```json
+{
+  "mcpServers": {
+    "agent-browser-mcp": {
+      "type": "stdio",
+      "command": "agent-browser-mcp"
+    }
+  }
+}
+```
 
-仓库中也放了示例：
+如果装在虚拟环境里，`command` 填可执行文件的绝对路径更稳，避免 PATH 里找不到：
+
+```json
+"command": "D:\\venvs\\agent-browser-mcp\\Scripts\\agent-browser-mcp.exe"
+```
+
+配置后重启 Claude Code，用 `/mcp` 确认服务已连接。
+
+### Claude Desktop / Cursor
+
+仓库里放了示例：
 - `examples/claude-desktop-config.json`
 - `examples/cursor-mcp.json`
 
-配置结构都很简单，核心就是：
+核心就是：
 
 ```json
 {
@@ -297,6 +307,22 @@ hermes mcp test agent_browser
   }
 }
 ```
+
+### Hermes
+
+把下面这段加到 `~/.hermes/config.yaml`：
+
+```yaml
+mcp_servers:
+  agent_browser:
+    command: agent-browser-mcp
+    timeout: 120
+    connect_timeout: 60
+```
+
+示例文件：`examples/hermes-config.yaml`。也可以用 `agent-browser-mcp print-hermes-config` 直接打印这段。
+
+配置后重启 Hermes，用 `hermes mcp list` 和 `hermes mcp test agent_browser` 验证。
 
 ## 典型使用流程
 
@@ -328,7 +354,7 @@ hermes mcp test agent_browser
 
 ## 常见问题
 
-### 1. Hermes 能看到 MCP 服务，但没有连接到任何标签页
+### 1. 客户端能看到 MCP 服务，但没有连接到任何标签页
 
 请检查：
 - 扩展是否已经在 `chrome://extensions` 中加载
@@ -359,12 +385,12 @@ agent-browser-mcp doctor
 - 辅助功能（Accessibility）
 - 屏幕录制（如果你需要桌面截图）
 
-### 4. `hermes mcp test agent_browser` 失败
+### 4. 客户端连不上这个 MCP 服务
 
 请检查：
 - 包是否安装成功
-- `agent-browser-mcp` 是否在 PATH 中
-- Hermes 配置是否正确
+- `agent-browser-mcp` 是否在 PATH 中；装在虚拟环境里的话，配置里直接填绝对路径
+- 客户端的 MCP 配置是否正确（Claude Code 用 `/mcp` 看，Hermes 用 `hermes mcp test agent_browser`）
 - 运行 `agent-browser-mcp doctor` 看诊断输出
 
 ## 致谢
