@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 authors = [
-  { name = "noxenys", email = "noxen.ys@gmail.com" }
+  { name = "noxenys" }
 ]
 keywords = ["mcp", "browser automation", "chrome", "cdp", "tmwebdriver", "claude-code"]
 classifiers = [
