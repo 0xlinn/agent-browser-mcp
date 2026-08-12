@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-browser-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "Real-browser MCP server with TMWebDriver/CDP bridge, screenshots, cookies, and physical input"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 authors = [
-  { name = "noxenys" }
+  { name = "0xlinn" }
 ]
 keywords = ["mcp", "browser automation", "chrome", "cdp", "tmwebdriver", "claude-code"]
 classifiers = [
@@ -32,10 +32,15 @@ dependencies = [
   "pillow"
 ]
 
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+]
+
 [project.urls]
-Homepage = "https://github.com/noxenys/agent-browser-mcp"
-Repository = "https://github.com/noxenys/agent-browser-mcp"
-Issues = "https://github.com/noxenys/agent-browser-mcp/issues"
+Homepage = "https://github.com/0xlinn/agent-browser-mcp"
+Repository = "https://github.com/0xlinn/agent-browser-mcp"
+Issues = "https://github.com/0xlinn/agent-browser-mcp/issues"
 
 [project.scripts]
 agent-browser-mcp = "agent_browser_mcp.cli:main"
@@ -49,3 +54,12 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 agent_browser_mcp = ["chrome_extension/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Live tests drive the user's real browser through a running bridge, so they are
+# opt-in: plain `pytest` runs only the offline layer. Use `-m live` for the rest.
+addopts = "-m 'not live'"
+markers = [
+  "live: needs the bridge daemon and the Chrome extension connected",
+]

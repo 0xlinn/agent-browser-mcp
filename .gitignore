@@ -1,10 +1,12 @@
 __pycache__/
+.pytest_cache/
 *.pyc
 *.pyo
 *.pyd
 .Python
 build/
 dist/
+out/
 *.egg-info/
 src/*.egg-info/
 .venv/
@@ -16,9 +18,19 @@ src/agent_browser_mcp/chrome_extension/config.js
 log
 temp_desktop.png
 
+# local agent/acceptance material
+.superpowers/
+AGENTS.md
+CLAUDE.md
+BUGREPORT.md
+SPEC.md
+DELIVER.md
+docs/superpowers/plans/
+
 # local scratch files
 _*.json
 _*.txt
 _*.md
+_*.py
 _mkq.py
 dune_editor.png

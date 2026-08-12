@@ -8,8 +8,12 @@
 if (window.__tmwd_content_loaded) return;
 window.__tmwd_content_loaded = true;
 
-// Remove meta CSP tags
-document.querySelectorAll('meta[http-equiv="Content-Security-Policy"]').forEach(e => e.remove());
+// NOTE: this script used to strip <meta http-equiv="Content-Security-Policy">
+// from every page it loaded into, which weakened the page's own protections
+// during ordinary browsing, not just under automation. CSP is now relaxed
+// per-tab and only for the duration of a command (see withCspOff in
+// background.js), and eval-blocking pages fall back to the CDP path, so the
+// unconditional meta removal is no longer needed.
 
 // Indicator badge — reflects real WS status via background (green=bridge, orange=inject-only)
 (function(){

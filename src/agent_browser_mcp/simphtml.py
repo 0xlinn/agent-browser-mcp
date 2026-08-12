@@ -7,6 +7,7 @@ function createEnhancedDOMCopy() {
   const ignoreTags = ['SCRIPT', 'STYLE', 'NOSCRIPT', 'META', 'LINK', 'COLGROUP', 'COL', 'TEMPLATE', 'PARAM', 'SOURCE'];  
   const ignoreIds = ['ljq-ind'];  
   function cloneNode(sourceNode, keep=false) {  
+    if (!sourceNode) return null;
     if (sourceNode.nodeType === 8 ||   
         (sourceNode.nodeType === 1 && (  
           ignoreTags.includes(sourceNode.tagName) ||   
@@ -55,11 +56,17 @@ function createEnhancedDOMCopy() {
     const rect = sourceNode.getBoundingClientRect();
     const style = window.getComputedStyle(sourceNode);
     const area = (style.display === 'none' || style.visibility === 'hidden' || parseFloat(style.opacity) <= 0)?0:rect.width * rect.height;
-    const isVisible = (rect.width > 1 && rect.height > 1 &&   
-                  style.display !== 'none' && style.visibility !== 'hidden' &&   
-                  parseFloat(style.opacity) > 0 &&  
-                  Math.abs(rect.left) < 5000 && Math.abs(rect.top) < 5000) 
-                  || isSmallDropdown;  
+    const renders = rect.width > 1 && rect.height > 1 &&
+                  style.display !== 'none' && style.visibility !== 'hidden' &&
+                  parseFloat(style.opacity) > 0;
+    // getBoundingClientRect is viewport-relative, so this is "within 5000px of
+    // the CURRENT scroll position", not of the document. Content past it used
+    // to vanish with no trace, and the agent would conclude the item isn't on
+    // the page. Still excluded (keeps the payload small), but now counted so
+    // the caller can say "scroll and re-scan".
+    const inRange = Math.abs(rect.left) < 5000 && Math.abs(rect.top) < 5000;
+    if (renders && !inRange) window.__tmwd_offscreen = (window.__tmwd_offscreen || 0) + 1;
+    const isVisible = (renders && inRange) || isSmallDropdown;
     const zIndex = style.position !== 'static' ? (parseInt(style.zIndex) || 0) : 0;
   
     let info = {
@@ -122,7 +129,15 @@ function createEnhancedDOMCopy() {
     }  
   };  
 }  
+window.__tmwd_offscreen = 0;
 const { domCopy, getNodeInfo, isVisible } = createEnhancedDOMCopy();
+if (!domCopy) {
+  if (text_only) return '';
+  const emptyRoot = document.createElement('body');
+  emptyRoot.setAttribute('data-tmwd-state', 'empty-document');
+  emptyRoot.insertAdjacentHTML('afterbegin', '<!--tmwd-base:' + location.href + '-->');
+  return emptyRoot.outerHTML;
+}
 if (text_only) {
   const blocks = new Set(['DIV','P','H1','H2','H3','H4','H5','H6','LI','TR','SECTION','ARTICLE','HEADER','FOOTER','NAV','BLOCKQUOTE','PRE','HR','BR','DT','DD','FIGCAPTION','DETAILS','SUMMARY']);
   domCopy.querySelectorAll('*').forEach(el => {
@@ -319,12 +334,28 @@ root.querySelectorAll('iframe').forEach(f => {
     f.parentNode.replaceChild(d, f);
   }
 });
+// Emit the page URL so relative hrefs can be resolved to absolute ones when
+// they get turned into refs. Comments survive outerHTML and are stripped again
+// before the HTML reaches the caller.
+root.insertAdjacentHTML('afterbegin', '<!--tmwd-base:' + location.href + '-->');
+// Tell the caller what the ±5000px viewport clamp dropped, plus where we are
+// in the document, so "nothing found" can be told apart from "not scrolled to
+// it yet". A comment survives outerHTML and costs nothing to parse.
+if (window.__tmwd_offscreen > 0) {
+  const de = document.documentElement;
+  root.insertAdjacentHTML('afterbegin',
+    '<!--tmwd-offscreen:' + window.__tmwd_offscreen +
+    ' scrollY:' + Math.round(window.scrollY) +
+    ' viewH:' + window.innerHeight +
+    ' docH:' + Math.max(de.scrollHeight, document.body.scrollHeight) + '-->');
+}
 return root.outerHTML;
     }
 optHTML()'''
 
 js_findMainList = r'''function findMainList(startElement = null) {
         const root = startElement || document.body;
+        if (!root) return [];
         const MIN_CHILDREN = 8;
         const MAX_CONTAINERS = 20;
 
@@ -590,17 +621,39 @@ js_findMainList = r'''function findMainList(startElement = null) {
         return totalScore;
     }'''
 
-def optimize_html_for_tokens(html):  
-    if type(html) is str: soup = BeautifulSoup(html, 'html.parser')  
+def optimize_html_for_tokens(html, link_refs=None, base_url=None):
+    """Shrink HTML for token budget.
+
+    link_refs: optional dict that collects {ref_id: real_url}. Long hrefs used
+    to be replaced by a bare '__link__', which threw the URL away entirely —
+    on a search results page the agent could read 30 titles and reach none of
+    them. Now each long href becomes a short '#r7'-style ref and the real URL
+    is handed back out of band, so the text stays small AND addressable.
+    """
+    if type(html) is str: soup = BeautifulSoup(html, 'html.parser')
     else: soup = html
     for svg in soup.find_all('svg'):
         svg.clear(); svg.attrs = {}
-    [tag.attrs.pop('style', None) for tag in soup.find_all(True)]  
-    for tag in soup.find_all(True):  
-        if tag.has_attr('src'):  
-            if tag['src'].startswith('data:'): tag['src'] = '__img__'  
-            elif len(tag['src']) > 30: tag['src'] = '__url__'  
-        if tag.has_attr('href') and len(tag['href']) > 30: tag['href'] = '__link__'  
+    [tag.attrs.pop('style', None) for tag in soup.find_all(True)]
+    for tag in soup.find_all(True):
+        if tag.has_attr('src'):
+            if tag['src'].startswith('data:'): tag['src'] = '__img__'
+            elif len(tag['src']) > 30: tag['src'] = '__url__'
+        if tag.has_attr('href') and len(tag['href']) > 30:
+            if link_refs is None:
+                tag['href'] = '__link__'
+            else:
+                url = tag['href']
+                if base_url:
+                    # Store absolute URLs: a ref of '/en-US/docs/x' is not
+                    # something open_url can navigate to.
+                    try: url = urljoin(base_url, url)
+                    except Exception: pass
+                ref = link_refs.get(url)
+                if ref is None:
+                    ref = f"r{len(link_refs) + 1}"
+                    link_refs[url] = ref
+                tag['href'] = f"#{ref}"
         if tag.has_attr('action') and len(tag['action']) > 30: tag['action'] = '__url__'
         for a in ('value', 'title', 'alt'):
             if tag.has_attr(a) and isinstance(tag[a], str) and len(tag[a]) > 100: tag[a] = tag[a][:50] + ' ...'
@@ -630,11 +683,18 @@ temp_monitor_js = """function startStrMonitor(interval) {
     }  
     startStrMonitor(450);  
 """  
-def start_temp_monitor(driver, timeout=15):
-    try: driver.execute_js(temp_monitor_js, timeout=timeout)
+def _execute_in_session(driver, script, timeout, session_id=None, **kwargs):
+    call_kwargs = {"timeout": timeout, **kwargs}
+    if session_id is not None:
+        call_kwargs["session_id"] = session_id
+    return driver.execute_js(script, **call_kwargs)
+
+
+def start_temp_monitor(driver, timeout=15, session_id=None):
+    try: _execute_in_session(driver, temp_monitor_js, timeout, session_id=session_id)
     except: pass
 
-def get_temp_texts(driver, timeout=15):
+def get_temp_texts(driver, timeout=15, session_id=None):
     js = """function stopStrMonitor() {  
         if (!window._tm) return [];  
         clearInterval(window._tm.id);  
@@ -651,14 +711,45 @@ def get_temp_texts(driver, timeout=15):
         }  
         stopStrMonitor();  
     """  
-    try: return list(set(driver.execute_js(js, timeout=timeout).get('data', [])))
+    try: return list(set(_execute_in_session(
+        driver, js, timeout, session_id=session_id).get('data', [])))
     except Exception as e:
         print(e)
         return []
     
-import time, re, os
-def get_main_block(driver, extra_js="", text_only=False, timeout=15):
-    page = driver.execute_js(f"{extra_js}\n{js_optHTML}\nreturn optHTML({str(text_only).lower()});", timeout=timeout).get('data', '')
+import time, re, os, json
+from urllib.parse import urljoin
+
+class PageUnavailable(RuntimeError):
+    """The page never answered, so there is no HTML to process.
+
+    Raised instead of quietly returning '' — an empty string used to flow
+    downstream and either divide by zero in the cutlist ratio or make the
+    agent believe the page was blank, throwing away the bridge's own
+    diagnosis of WHY it didn't answer.
+    """
+
+def get_main_block(driver, extra_js="", text_only=False, timeout=15,
+                   allow_failover=False, session_id=None):
+    # Default is no failover. Reading has no side effects, but silently reading
+    # a DIFFERENT tab than the caller asked for is its own wrong answer: the
+    # agent gets a page it never requested and no indication of the swap.
+    raw = _execute_in_session(
+        driver,
+        f"{extra_js}\n{js_optHTML}\nreturn optHTML({str(text_only).lower()});",
+        timeout,
+        session_id=session_id,
+        allow_failover=allow_failover,
+    )
+    # A timeout carries no 'data' at all, only 'result' with the reason.
+    if 'data' not in raw:
+        reason = raw.get('result') or 'no data returned'
+        raise PageUnavailable(
+            f"{reason}. Run list_tabs to see live tabs, then switch_tab to the one you meant.")
+    page = raw.get('data')
+    if page is None:
+        raise PageUnavailable(
+            "page returned null instead of HTML. Run list_tabs / switch_tab to confirm the target tab.")
     if text_only:
         page = re.sub(r' {2,}', ' ', page)           # 连续空格→单空格
         page = re.sub(r'^ +', '', page, flags=re.M)   # 去行首空格
@@ -699,14 +790,36 @@ def find_changed_elements(before_html, after_html):
         result["top_change"] = h if len(h) <= 2000 else h[:2000] + '...[TRUNCATED]'
     return result
 
-def get_html(driver, cutlist=False, maxchars=35000, instruction="", extra_js="", text_only=False, timeout=15):
-    if cutlist: rr = driver.execute_js(js_findMainList + "return findMainList(document.body);", timeout=timeout).get('data', [])
-    page = get_main_block(driver, extra_js=extra_js, text_only=text_only, timeout=timeout)
+def get_html(driver, cutlist=False, maxchars=35000, instruction="", extra_js="",
+             text_only=False, timeout=15, link_refs=None, session_id=None):
+    if cutlist:
+        rr = _execute_in_session(
+            driver,
+            js_findMainList + "return findMainList(document.body);",
+            timeout,
+            session_id=session_id,
+        ).get('data', [])
+    page = get_main_block(
+        driver,
+        extra_js=extra_js,
+        text_only=text_only,
+        timeout=timeout,
+        session_id=session_id,
+    )
     # Hard cap before parsing: BeautifulSoup on a multi-MB page dominates the
     # call's latency, and callers only ever see maxchars of it anyway.
     if isinstance(page, str) and len(page) > 1_500_000: page = page[:1_500_000]
     if text_only: return page
-    soup = optimize_html_for_tokens(page)
+    base_url = None
+    if isinstance(page, str):
+        m = re.search(r'<!--tmwd-base:(.*?)-->', page)
+        if m:
+            base_url = m.group(1)
+            # Consumed here; the caller already knows the URL from list_tabs, so
+            # don't spend tokens on it. The offscreen marker stays: server.py
+            # parses it out of the returned HTML.
+            page = page.replace(m.group(0), '', 1)
+    soup = optimize_html_for_tokens(page, link_refs=link_refs, base_url=base_url)
     for div in soup.select('div[data-tag="iframe"]'):
         div.name = 'iframe'; del div['data-tag']
     html = str(soup)
@@ -736,8 +849,9 @@ def get_html(driver, cutlist=False, maxchars=35000, instruction="", extra_js="",
         hint_tag.string = ' '.join(hint_parts)
         if keep: keep[-1].insert_after(hint_tag)
         for it in removed: it.decompose()
-    ss = str(optimize_html_for_tokens(soup)) if lists else html
-    print(f"[get_html] Result: {len(html)} -> {len(ss)} chars after cutlist ({100-len(ss)*100//len(html)}% saved)")
+    ss = str(optimize_html_for_tokens(soup, link_refs=link_refs, base_url=base_url)) if lists else html
+    saved = f"{100 - len(ss) * 100 // len(html)}% saved" if html else "empty page"
+    print(f"[get_html] Result: {len(html)} -> {len(ss)} chars after cutlist ({saved})")
     if len(ss) > maxchars: ss = str(smart_truncate(soup, maxchars))
     return ss
 
@@ -833,39 +947,128 @@ def no_response_kind(response):
     if not isinstance(msg, str): return None
     if 'no ACK' in msg or 'script not polled' in msg: return 'undelivered'
     if 'ACK received' in msg or 'delivered but no result' in msg: return 'after_ack'
+    # The page unloaded before the result came back (click -> navigation, the
+    # single most common action). This is NOT a timeout and NOT a success: the
+    # script's return value is gone for good. Without this branch the caller
+    # fell through to status:"success" with the diagnostic string masquerading
+    # as js_return.
+    if 'reloaded' in msg: return 'navigated'
     return None
 
-def execute_js_rich(script, driver, no_monitor=False, timeout=15, before_sids=None):
+def _remaining(deadline, cap=None):
+    remaining = max(0.0, deadline - time.monotonic())
+    return min(remaining, cap) if cap is not None else remaining
+
+
+def execute_js_rich(
+    script,
+    driver,
+    no_monitor=False,
+    timeout=15,
+    before_sids=None,
+    session_id=None,
+    deadline=None,
+):
+    """Execute one script with a single end-to-end deadline.
+
+    ``session_id`` is forwarded to every browser roundtrip, including baseline,
+    retry, navigation-location, transient, and DOM-diff reads. ``deadline`` is
+    supplied by the server so dialog policy setup and cleanup share the same
+    budget; direct callers get a deadline derived from ``timeout``.
+    """
+    configured_timeout = max(0.001, float(timeout))
+    deadline = deadline if deadline is not None else time.monotonic() + configured_timeout
     last_html = None
-    if not no_monitor:
-        try: last_html = get_html(driver, cutlist=False, extra_js=temp_monitor_js,
-                                  maxchars=MONITOR_MAXCHARS, timeout=MONITOR_TIMEOUT)
-        except: pass
-    result = None;  error_msg = None;  reloaded = False; newTabs = []
+
+    def phase_timeout(cap=None):
+        remaining = _remaining(deadline, cap)
+        return remaining if remaining > 0.001 else 0.0
+
+    if not no_monitor and phase_timeout(MONITOR_TIMEOUT):
+        try:
+            last_html = get_html(
+                driver,
+                cutlist=False,
+                extra_js=temp_monitor_js,
+                maxchars=MONITOR_MAXCHARS,
+                timeout=phase_timeout(MONITOR_TIMEOUT),
+                session_id=session_id,
+            )
+        except Exception as e:
+            print(f"[monitor] baseline snapshot unavailable: {e}")
     if before_sids is None:
-        try: before_sids = set(driver.get_session_dict(timeout=MONITOR_TIMEOUT).keys())
-        except: before_sids = set()
+        try:
+            session_timeout = phase_timeout(MONITOR_TIMEOUT)
+            if session_timeout:
+                before_sids = set(driver.get_session_dict(timeout=session_timeout).keys())
+            else:
+                before_sids = set()
+        except Exception as e:
+            print(f"[monitor] session snapshot unavailable: {e}")
+            before_sids = set()
+
+    result = None
+    error_msg = None
+    reloaded = False
+    newTabs = []
     response = {}
+    blocked_dialog = False
     try:
         print(f"Executing: {script[:250]} ...")
-        response = driver.execute_js(script, timeout=timeout)
-        if no_response_kind(response) == 'undelivered':
-            # Never reached the page (session asleep / SW reconnecting):
-            # retrying is side-effect-free.
-            print("No ACK; retrying once...")
-            response = driver.execute_js(script, timeout=timeout)
-        result = response['data'] if 'data' in response else response.get('result')
-        if response.get('closed', 0) == 1: reloaded = True
-        time.sleep(1)
+        call_timeout = phase_timeout()
+        if call_timeout:
+            response = _execute_in_session(
+                driver, script, call_timeout, session_id=session_id
+            )
+        else:
+            response = {
+                'result': (
+                    f"No response data in {configured_timeout}s "
+                    "(no ACK, total execute_js deadline exhausted)"
+                )
+            }
+        if no_response_kind(response) == 'undelivered' and phase_timeout():
+            # Never reached the page (session asleep / SW reconnecting): retry
+            # only with the time still left in the original budget.
+            print("No ACK; retrying once within the remaining deadline...")
+            response = _execute_in_session(
+                driver,
+                script,
+                phase_timeout(),
+                session_id=session_id,
+            )
+        result = response['data'] if 'data' in response else None
+        blocked_dialog = bool(
+            isinstance(result, dict)
+            and result.get('__tmwd_dialog_result') is True
+            and result.get('status') == 'blocked_by_dialog'
+        )
+        if response.get('closed', 0) == 1:
+            reloaded = True
+        if not blocked_dialog and not no_response_kind(response):
+            time.sleep(min(1.0, _remaining(deadline)))
     except Exception as e:
         error = e.args[0] if e.args else str(e)
         if isinstance(error, dict): error.pop('stack', None)
         error_msg = str(error)
         print(f"Error: {error_msg}")
+
+    etab = response.get('executed_tab_id')
+    if isinstance(etab, int):
+        tab_id_field = etab
+    else:
+        sid_for_tab = session_id or getattr(driver, 'default_session_id', None)
+        if sid_for_tab and ':' in str(sid_for_tab):
+            try:
+                tab_id_field = int(str(sid_for_tab).rsplit(':', 1)[-1])
+            except ValueError:
+                tab_id_field = None
+        else:
+            tab_id_field = None
     rr = {
         "status": "failed" if error_msg else "success",
         "js_return": result,
-        "tab_id": driver.default_session_id
+        "tab_id": tab_id_field,
     }
     if reloaded: rr['reloaded'] = reloaded
     if response.get('switched_session'):
@@ -873,33 +1076,69 @@ def execute_js_rich(script, driver, no_monitor=False, timeout=15, before_sids=No
         rr['switched_from'] = response.get('switched_from')
         rr['switch_note'] = "原会话已断开，本次已在同浏览器的另一会话执行；如目标不对请 list_tabs 后 switch_tab。"
     kind = no_response_kind(response)
-    if kind and not error_msg:
+    if kind == 'navigated' and not error_msg:
+        rr['status'] = 'navigated'
+        rr['js_return_lost'] = "页面在返回值回传前已卸载，脚本返回值无法获取"
+        try:
+            location_timeout = phase_timeout(MONITOR_TIMEOUT)
+            if location_timeout:
+                landed = _execute_in_session(
+                    driver,
+                    "JSON.stringify({url: location.href, title: document.title})",
+                    location_timeout,
+                    session_id=session_id,
+                )
+                if isinstance(landed, dict) and 'data' in landed:
+                    info = json.loads(landed['data']) if isinstance(landed['data'], str) else landed['data']
+                    rr['landed_url'] = info.get('url')
+                    rr['landed_title'] = info.get('title')
+        except Exception as e:
+            print(f"[monitor] post-navigation location unavailable: {e}")
+        rr['suggestion'] = "脚本已执行且页面已导航。请核对 landed_url 是否为预期页面；脚本返回值已丢失，如需读取请在新页面重新执行。"
+    elif kind and not error_msg:
         rr['status'] = 'no_response'
         rr['suggestion'] = (
             "脚本未送达（已自动重试1次仍无ACK）：会话可能休眠或断开。先 list_tabs 确认目标，switch_tab 后重试。"
             if kind == 'undelivered' else
             "脚本已送达但超时未返回：可能仍在执行或页面被阻塞（如验证码）。勿盲目重试有副作用的脚本，先 scan_page 查看当前状态，或加大 timeout 重试只读脚本。"
         )
-    if response.get('newTabs'): rr['newTabs'] = response['newTabs']
+    if blocked_dialog:
+        if response.get('newTabs'):
+            rr['newTabs'] = response['newTabs']
+        return rr
+    if response.get('newTabs'):
+        rr['newTabs'] = response['newTabs']
     elif not error_msg and not kind:
         try:
-            after = driver.get_session_dict(timeout=MONITOR_TIMEOUT)
+            session_timeout = phase_timeout(MONITOR_TIMEOUT)
+            after = driver.get_session_dict(timeout=session_timeout) if session_timeout else {}
             new_sids = {k: v for k, v in after.items() if k not in before_sids}
-        except: new_sids = {}
+        except Exception:
+            new_sids = {}
         if new_sids:
             newTabs = [{'id': k, 'url': v} for k, v in new_sids.items()]
             rr['newTabs'] = newTabs
             rr['suggestion'] = "页面已刷新，以上新标签页在执行期间连接。"
     if error_msg: rr['error'] = error_msg
-    # A no_response session is likely asleep; skip the post-monitor roundtrips.
     if no_monitor or kind: return rr
-    if not reloaded:
-        try: rr['transients'] = get_temp_texts(driver, timeout=MONITOR_TIMEOUT)
-        except: rr['transients'] = []
-    if not reloaded and not error_msg and len(newTabs) == 0:
+    if not reloaded and phase_timeout(MONITOR_TIMEOUT):
         try:
-            current_html = get_html(driver, cutlist=False, maxchars=MONITOR_MAXCHARS,
-                                    timeout=MONITOR_TIMEOUT)
+            rr['transients'] = get_temp_texts(
+                driver,
+                timeout=phase_timeout(MONITOR_TIMEOUT),
+                session_id=session_id,
+            )
+        except Exception:
+            rr['transients'] = []
+    if not reloaded and not error_msg and len(newTabs) == 0 and phase_timeout(MONITOR_TIMEOUT):
+        try:
+            current_html = get_html(
+                driver,
+                cutlist=False,
+                maxchars=MONITOR_MAXCHARS,
+                timeout=phase_timeout(MONITOR_TIMEOUT),
+                session_id=session_id,
+            )
             if last_html is None: raise Exception("no baseline")
             diff_data = find_changed_elements(last_html, current_html)
             change_count = diff_data.get('changed', 0)
@@ -910,7 +1149,7 @@ def execute_js_rich(script, driver, no_monitor=False, timeout=15, before_sids=No
             if change_count == 0 and not transients and len(newTabs) == 0:
                 diff_summary += " (页面无变化)"
                 rr['suggestion'] = "页面无明显变化"
-        except:
+        except Exception:
             diff_summary = "页面变化监控不可用"
         rr['diff'] = diff_summary
     return rr

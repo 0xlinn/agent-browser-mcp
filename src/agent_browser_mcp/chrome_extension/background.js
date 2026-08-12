@@ -1,18 +1,12 @@
 // background.js - Cookie + CDP Bridge
 chrome.runtime.onInstalled.addListener(() => {
   console.log('CDP Bridge installed');
-  // Strip CSP headers to allow eval/inline scripts
-  chrome.declarativeNetRequest.updateDynamicRules({
-    removeRuleIds: [9999],
-    addRules: [{
-      id: 9999, priority: 1,
-      action: { type: 'modifyHeaders', responseHeaders: [
-        { header: 'content-security-policy', operation: 'remove' },
-        { header: 'content-security-policy-report-only', operation: 'remove' }
-      ]},
-      condition: { urlFilter: '*', resourceTypes: ['main_frame', 'sub_frame'] }
-    }]
-  });
+  // Drop the old browser-wide CSP-stripping rule if this is an upgrade.
+  // It used urlFilter:'*' as a DYNAMIC rule, so it survived restarts and
+  // disabled CSP for every site in the profile — bank, mail, everything —
+  // for as long as the extension stayed installed. CSP is now stripped
+  // per-tab and only while a script is actually running (see withCspOff).
+  chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: [9999] });
   // Re-inject content scripts into already-open pages. After an extension
   // reload, pages opened under the OLD extension keep running orphaned
   // content.js whose chrome.runtime points at a dead context — their badge
@@ -40,7 +34,1694 @@ async function reinjectAllTabs() {
   }
 }
 
+// --- Bounded, tab-scoped JavaScript dialog state --------------------------
+const DIALOG_STATE_TTL_MS = 30000;
+const protocolDialogStates = new Map();
+const dialogAttachedTabs = new Set();
+const debuggerAttachments = new Map();
+const debuggerRecoveryPromises = new Map();
+const pendingNavigations = new Map();
+const execDialogPolicies = new Map();
+const pendingManualExecutions = new Map();
+const runtimeExecutionContexts = new Map();
+const runtimeContextWaiters = new Map();
+const dialogEventSequences = new Map();
+const manualExecutionGenerations = new Map();
+const networkCaptures = new Map();
+const consoleCaptures = new Map();
+let nextDialogScope = 1;
+let nextManualExecutionGeneration = 1;
+const DEFAULT_CDP_TIMEOUT_MS = 20000;
+const MAX_CDP_TIMEOUT_MS = 120000;
+
+// --- Stable tab lifecycle generations ------------------------------------
+// A native tab id can be reused after close/restart while the Python bridge
+// still has an active-looking session under clientId:tabId. Pair every tab
+// lifecycle with a generation that survives service-worker eviction (session
+// storage lasts for the browser session) so open_new_tab never accepts a stale
+// registration merely because the numeric id matches.
+const TAB_GENERATIONS_KEY = 'tmwdTabGenerationsV1'; // gitleaks:allow - storage key, not a credential
+const tabGenerations = new Map();
+const tabGenerationAssignments = new Map();
+let tabGenerationsLoadPromise = null;
+let tabGenerationWriteQueue = Promise.resolve();
+let nextTabGeneration = 1;
+
+function newTabGeneration() {
+  const random = globalThis.crypto?.randomUUID?.() || Math.random().toString(36).slice(2);
+  return `${Date.now().toString(36)}-${nextTabGeneration++}-${random}`;
+}
+
+function persistTabGenerations() {
+  const area = chrome.storage?.session;
+  if (!area) return Promise.resolve();
+  const snapshot = Object.fromEntries(tabGenerations);
+  tabGenerationWriteQueue = tabGenerationWriteQueue
+    .then(() => area.set({ [TAB_GENERATIONS_KEY]: snapshot }))
+    .catch(error => console.log('[TMWD-WS] tab generation persistence unavailable', error));
+  return tabGenerationWriteQueue;
+}
+
+async function loadTabGenerations() {
+  if (tabGenerationsLoadPromise) return await tabGenerationsLoadPromise;
+  tabGenerationsLoadPromise = (async () => {
+    let stored = {};
+    try {
+      const area = chrome.storage?.session;
+      if (area) stored = (await area.get(TAB_GENERATIONS_KEY))[TAB_GENERATIONS_KEY] || {};
+    } catch (_) {}
+    const tabs = await chrome.tabs.query({}).catch(() => []);
+    const live = new Set(tabs.map(tab => String(tab.id)));
+    for (const [rawId, generation] of Object.entries(stored)) {
+      if (live.has(String(rawId)) && typeof generation === 'string') {
+        tabGenerations.set(Number(rawId), generation);
+      }
+    }
+    for (const tab of tabs) {
+      if (!tabGenerations.has(tab.id)) tabGenerations.set(tab.id, newTabGeneration());
+    }
+    await persistTabGenerations();
+  })();
+  return await tabGenerationsLoadPromise;
+}
+
+function scheduleNewTabGeneration(tabId) {
+  if (tabGenerationAssignments.has(tabId)) return tabGenerationAssignments.get(tabId);
+  const assignment = (async () => {
+    await loadTabGenerations();
+    const generation = newTabGeneration();
+    tabGenerations.set(tabId, generation);
+    await persistTabGenerations();
+    return generation;
+  })().finally(() => tabGenerationAssignments.delete(tabId));
+  tabGenerationAssignments.set(tabId, assignment);
+  return assignment;
+}
+
+async function tabGenerationFor(tabId) {
+  const pending = tabGenerationAssignments.get(tabId);
+  if (pending) return await pending;
+  await loadTabGenerations();
+  if (!tabGenerations.has(tabId)) {
+    tabGenerations.set(tabId, newTabGeneration());
+    await persistTabGenerations();
+  }
+  return tabGenerations.get(tabId);
+}
+
+async function forgetTabGeneration(tabId) {
+  const pending = tabGenerationAssignments.get(tabId);
+  if (pending) await pending.catch(() => {});
+  await loadTabGenerations();
+  tabGenerations.delete(tabId);
+  await persistTabGenerations();
+}
+
+// --- Temporary, origin-scoped site-permission leases ----------------------
+const PERMISSION_LEASES_KEY = 'tmwdPermissionLeases';
+const PERMISSION_ALARM_PREFIX = 'tmwd-permission:';
+const PERMISSION_LEASE_STAGED = 'staged';
+const PERMISSION_LEASE_ACTIVE = 'active';
+const SITE_PERMISSION_SETTINGS = new Set(['allow', 'block', 'ask']);
+const SITE_PERMISSION_CONTENT_SETTINGS = {
+  notifications: 'notifications',
+  geolocation: 'location',
+  location: 'location',
+  camera: 'camera',
+  microphone: 'microphone',
+};
+let permissionLeaseQueue = Promise.resolve();
+let nextPermissionAlarmSequence = 1;
+
+function withPermissionLeaseLock(work) {
+  const next = permissionLeaseQueue.then(work, work);
+  permissionLeaseQueue = next.catch(() => {});
+  return next;
+}
+
+function normalizePermissionOrigin(raw) {
+  try {
+    const url = new URL(String(raw || ''));
+    if ((url.protocol !== 'http:' && url.protocol !== 'https:') || !url.hostname ||
+        url.username || url.password) {
+      return null;
+    }
+    return url.origin;
+  } catch (_) {
+    return null;
+  }
+}
+
+function permissionLeaseId(origin, permission) {
+  return `${encodeURIComponent(origin)}:${permission}`;
+}
+
+function permissionAlarmName(lease) {
+  return typeof lease.alarmName === 'string' && lease.alarmName.startsWith(PERMISSION_ALARM_PREFIX)
+    ? lease.alarmName
+    : `${PERMISSION_ALARM_PREFIX}${lease.id}`;
+}
+
+function permissionRetryAlarmName(lease) {
+  return `${PERMISSION_ALARM_PREFIX}retry:${lease.id}`;
+}
+
+function newPermissionAlarmName(id) {
+  return `${PERMISSION_ALARM_PREFIX}${id}:${Date.now()}:${nextPermissionAlarmSequence++}`;
+}
+
+async function clearPermissionAlarm(name) {
+  try { await chrome.alarms.clear(name); } catch (_) {}
+}
+
+async function schedulePermissionRetry(lease) {
+  await chrome.alarms.create(
+    permissionRetryAlarmName(lease), { when: Date.now() + 60000 },
+  );
+}
+
+async function loadPermissionLeases() {
+  const stored = await chrome.storage.local.get(PERMISSION_LEASES_KEY);
+  const leases = stored[PERMISSION_LEASES_KEY];
+  return Array.isArray(leases) ? leases.filter(lease => lease && typeof lease === 'object') : [];
+}
+
+async function savePermissionLeases(leases) {
+  await chrome.storage.local.set({ [PERMISSION_LEASES_KEY]: leases });
+}
+
+function contentSettingForPermission(permission) {
+  return SITE_PERMISSION_CONTENT_SETTINGS[permission] || null;
+}
+
+async function setClipboardPermission(tabId, origin, setting) {
+  if (!Number.isInteger(tabId)) {
+    return { ok: false, unsupported: true, error: 'clipboard permission requires a tabId' };
+  }
+  let debuggerLease = null;
+  try {
+    debuggerLease = await attachAbmDebugger({ tabId });
+    await sendDebuggerCommandWithTimeout(debuggerLease, 'Browser.setPermission', {
+      permission: { name: 'clipboard-read' },
+      setting: setting === 'allow' ? 'granted' : setting === 'block' ? 'denied' : 'prompt',
+      origin,
+    }, DEFAULT_CDP_TIMEOUT_MS);
+    return { ok: true };
+  } catch (error) {
+    // The extension debugger commonly rejects Browser.*. It is never safe to
+    // fall back to page or physical input for a browser permission operation.
+    return { ok: false, unsupported: true, error: error.message || String(error) };
+  } finally {
+    if (debuggerLease) {
+      try { await detachAbmDebugger(debuggerLease); } catch (_) {}
+    }
+  }
+}
+
+async function applyPermissionLease(lease, setting) {
+  if (lease.kind === 'clipboard') {
+    return await setClipboardPermission(lease.tabId, lease.origin, setting);
+  }
+  const contentSetting = chrome.contentSettings?.[lease.contentSetting];
+  if (!contentSetting) {
+    return { ok: false, unsupported: true, error: `content setting unavailable: ${lease.contentSetting}` };
+  }
+  try {
+    await contentSetting.set({ primaryPattern: `${lease.origin}/*`, setting });
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: error.message || String(error) };
+  }
+}
+
+async function restorePermissionLease(lease) {
+  return await applyPermissionLease(lease, lease.previousSetting);
+}
+
+async function restorePermissionLeaseMatches(matches) {
+  const leases = await loadPermissionLeases();
+  const kept = [];
+  const succeeded = [];
+  const attempted = [];
+  let restored = 0;
+  const failures = [];
+  for (const lease of leases) {
+    if (!matches(lease)) {
+      kept.push(lease);
+      continue;
+    }
+    attempted.push(lease);
+    const result = await restorePermissionLease(lease);
+    if (result.ok) {
+      restored += 1;
+      succeeded.push(lease);
+    } else {
+      // A failed restore must survive worker eviction and retries.
+      kept.push(lease);
+      failures.push({ id: lease.id, error: result.error || 'restore failed', unsupported: !!result.unsupported });
+    }
+  }
+  if (!attempted.length) {
+    return { ok: true, restored: 0, failures: [], remaining: kept.length };
+  }
+  try {
+    await savePermissionLeases(kept);
+  } catch (error) {
+    for (const lease of attempted) {
+      try { await schedulePermissionRetry(lease); } catch (_) {}
+    }
+    return {
+      ok: false,
+      restored,
+      failures: [...failures, { id: '', error: error.message || String(error), storage: true }],
+      remaining: leases.length,
+      recovery_pending: true,
+      recovery_error: error.message || String(error),
+    };
+  }
+  for (const lease of succeeded) {
+    await clearPermissionAlarm(permissionAlarmName(lease));
+    await clearPermissionAlarm(permissionRetryAlarmName(lease));
+  }
+  for (const failure of failures) {
+    const lease = kept.find(item => item.id === failure.id);
+    if (!lease) continue;
+    try {
+      await schedulePermissionRetry(lease);
+    } catch (error) {
+      failure.recovery_error = error.message || String(error);
+    }
+  }
+  return {
+    ok: failures.length === 0,
+    restored,
+    failures,
+    remaining: kept.length,
+    ...(failures.length ? { recovery_pending: true } : {}),
+  };
+}
+
+async function restoreExpiredPermissionLeases() {
+  return await withPermissionLeaseLock(async () => {
+    const now = Date.now();
+    return await restorePermissionLeaseMatches(lease =>
+      lease.state === PERMISSION_LEASE_STAGED || Number(lease.expiresAt) <= now
+    );
+  });
+}
+
+function installPermissionLeaseRecoveryHooks() {
+  chrome.alarms.onAlarm.addListener(async alarm => {
+    if (alarm?.name?.startsWith(PERMISSION_ALARM_PREFIX)) {
+      return await restoreExpiredPermissionLeases();
+    }
+  });
+  chrome.runtime.onStartup.addListener(async () => await restoreExpiredPermissionLeases());
+  chrome.runtime.onInstalled.addListener(async () => await restoreExpiredPermissionLeases());
+  // A service-worker wake evaluates this file from the top, so the immediate
+  // sweep also recovers interrupted staged mutations.
+  return restoreExpiredPermissionLeases();
+}
+
+async function resetSitePermissionLeases({ origin = '', permission = '' } = {}) {
+  const normalizedOrigin = origin ? normalizePermissionOrigin(origin) : '';
+  if (origin && !normalizedOrigin) return { ok: false, error: 'origin must be an http or https origin' };
+  const contentSetting = permission ? contentSettingForPermission(permission) : null;
+  if (permission && permission !== 'clipboard' && !contentSetting) {
+    return { ok: false, error: 'unsupported permission' };
+  }
+  const canonicalPermission = contentSetting || permission;
+  return await withPermissionLeaseLock(async () => await restorePermissionLeaseMatches(lease =>
+    (!normalizedOrigin || lease.origin === normalizedOrigin) &&
+    (!canonicalPermission || lease.permission === canonicalPermission)
+  ));
+}
+
+async function setSitePermission(msg) {
+  const origin = normalizePermissionOrigin(msg.origin);
+  const durationSeconds = msg.durationSeconds;
+  const setting = msg.setting;
+  const contentSetting = contentSettingForPermission(msg.permission);
+  if (!origin) return { ok: false, error: 'origin must be an http or https origin' };
+  if (!SITE_PERMISSION_SETTINGS.has(setting)) return { ok: false, error: 'invalid permission setting' };
+  if (!Number.isInteger(durationSeconds) || durationSeconds < 60 || durationSeconds > 600) {
+    return { ok: false, error: 'durationSeconds must be an integer from 60 to 600' };
+  }
+  if (msg.permission !== 'clipboard' && !contentSetting) {
+    return { ok: false, error: 'unsupported permission' };
+  }
+  if (msg.permission === 'clipboard') {
+    return {
+      ok: false,
+      unsupported: true,
+      error: 'clipboard permission leases are unsupported because the exact prior state cannot be restored',
+    };
+  }
+
+  return await withPermissionLeaseLock(async () => {
+    const now = Date.now();
+    const recovery = await restorePermissionLeaseMatches(lease =>
+      lease.state === PERMISSION_LEASE_STAGED || Number(lease.expiresAt) <= now
+    );
+    if (!recovery.ok) {
+      return {
+        ok: false,
+        error: 'an earlier site-permission lease is still awaiting recovery',
+        recovery_pending: true,
+        recovery_error: recovery.recovery_error || recovery.failures?.[0]?.error || 'restore failed',
+        origin,
+        permission: contentSetting,
+      };
+    }
+    const permission = contentSetting || 'clipboard';
+    const leases = await loadPermissionLeases();
+    const id = permissionLeaseId(origin, permission);
+    const existing = leases.find(lease => lease.id === id) || null;
+    const api = chrome.contentSettings?.[contentSetting];
+    if (!api) return { ok: false, unsupported: true, error: `content setting unavailable: ${contentSetting}` };
+    let effectiveSetting;
+    try {
+      const current = await api.get({ primaryUrl: origin });
+      effectiveSetting = current?.setting;
+    } catch (error) {
+      return { ok: false, error: error.message || String(error) };
+    }
+    if (typeof effectiveSetting !== 'string') return { ok: false, error: 'content setting has no restorable state' };
+    const previousSetting = existing ? existing.previousSetting : effectiveSetting;
+    const lease = {
+      id,
+      origin,
+      permission,
+      kind: permission === 'clipboard' ? 'clipboard' : 'content',
+      contentSetting: permission === 'clipboard' ? undefined : contentSetting,
+      previousSetting,
+      tabId: permission === 'clipboard' ? msg.tabId : undefined,
+      expiresAt: Date.now() + durationSeconds * 1000,
+      alarmName: newPermissionAlarmName(id),
+      state: PERMISSION_LEASE_ACTIVE,
+    };
+    const updated = leases.filter(item => item.id !== id);
+    updated.push(lease);
+
+    const failure = (result, recoveryPending, recoveryError = '') => ({
+      ...result,
+      lease_id: id,
+      origin,
+      permission,
+      recovery_pending: !!recoveryPending,
+      ...(recoveryError ? { recovery_error: recoveryError } : {}),
+    });
+
+    if (existing) {
+      // The existing record and alarm stay untouched through mutation and
+      // rollback. They remain the durable upper bound on the old lease.
+      const applied = await applyPermissionLease(lease, setting);
+      if (!applied.ok) {
+        const rolledBack = await applyPermissionLease(lease, effectiveSetting);
+        return failure(
+          applied,
+          !rolledBack.ok,
+          rolledBack.ok ? '' : (rolledBack.error || 'rollback failed'),
+        );
+      }
+      try {
+        await chrome.alarms.create(lease.alarmName, { when: lease.expiresAt });
+      } catch (error) {
+        const rolledBack = await applyPermissionLease(lease, effectiveSetting);
+        return failure(
+          { ok: false, error: error.message || String(error) },
+          !rolledBack.ok,
+          rolledBack.ok ? '' : (rolledBack.error || 'rollback failed'),
+        );
+      }
+      try {
+        await savePermissionLeases(updated);
+      } catch (error) {
+        const rolledBack = await applyPermissionLease(lease, effectiveSetting);
+        await clearPermissionAlarm(lease.alarmName);
+        return failure(
+          { ok: false, error: error.message || String(error) },
+          !rolledBack.ok,
+          rolledBack.ok ? '' : (rolledBack.error || 'rollback failed'),
+        );
+      }
+      await clearPermissionAlarm(permissionAlarmName(existing));
+      await clearPermissionAlarm(permissionRetryAlarmName(existing));
+      return { ok: true, lease_id: id, origin, permission, expires_at: lease.expiresAt };
+    }
+
+    const stagedLease = { ...lease, state: PERMISSION_LEASE_STAGED };
+    const staged = leases.filter(item => item.id !== id);
+    staged.push(stagedLease);
+    try {
+      await savePermissionLeases(staged);
+    } catch (error) {
+      return failure({ ok: false, error: error.message || String(error) }, false);
+    }
+    try {
+      await chrome.alarms.create(stagedLease.alarmName, { when: stagedLease.expiresAt });
+    } catch (error) {
+      try {
+        await savePermissionLeases(leases);
+        await clearPermissionAlarm(stagedLease.alarmName);
+        return failure({ ok: false, error: error.message || String(error) }, false);
+      } catch (cleanupError) {
+        return failure(
+          { ok: false, error: error.message || String(error) },
+          true,
+          cleanupError.message || String(cleanupError),
+        );
+      }
+    }
+
+    const applied = await applyPermissionLease(stagedLease, setting);
+    if (!applied.ok) {
+      const rolledBack = await applyPermissionLease(stagedLease, stagedLease.previousSetting);
+      if (rolledBack.ok) {
+        try {
+          await savePermissionLeases(leases);
+          await clearPermissionAlarm(stagedLease.alarmName);
+          return failure(applied, false);
+        } catch (error) {
+          return failure(applied, true, error.message || String(error));
+        }
+      }
+      return failure(applied, true, rolledBack.error || 'rollback failed');
+    }
+    try {
+      await savePermissionLeases(updated);
+    } catch (error) {
+      const rolledBack = await applyPermissionLease(stagedLease, stagedLease.previousSetting);
+      if (rolledBack.ok) {
+        try {
+          await savePermissionLeases(leases);
+          await clearPermissionAlarm(stagedLease.alarmName);
+          return failure({ ok: false, error: error.message || String(error) }, false);
+        } catch (cleanupError) {
+          return failure(
+            { ok: false, error: error.message || String(error) },
+            true,
+            cleanupError.message || String(cleanupError),
+          );
+        }
+      }
+      return failure(
+        { ok: false, error: error.message || String(error) },
+        true,
+        rolledBack.error || 'rollback failed',
+      );
+    }
+    return { ok: true, lease_id: id, origin, permission, expires_at: lease.expiresAt };
+  });
+}
+
+function validDialogPolicy(policy) {
+  return policy === 'dismiss' || policy === 'accept' || policy === 'manual';
+}
+
+function currentProtocolDialog(tabId) {
+  const state = protocolDialogStates.get(tabId);
+  if (state && Date.now() - state.openedAt < DIALOG_STATE_TTL_MS) return state;
+  if (state) protocolDialogStates.delete(tabId);
+  return null;
+}
+
+function rememberProtocolDialog(tabId, params) {
+  const state = {
+    type: params.type,
+    message: params.message || '',
+    url: params.url || '',
+    defaultPrompt: params.defaultPrompt || '',
+    openedAt: Date.now(),
+  };
+  protocolDialogStates.set(tabId, state);
+  setTimeout(() => {
+    if (protocolDialogStates.get(tabId)?.openedAt === state.openedAt) {
+      protocolDialogStates.delete(tabId);
+    }
+  }, DIALOG_STATE_TTL_MS);
+  return state;
+}
+
+function rememberRuntimeExecutionContext(tabId, context) {
+  if (!context || !Number.isInteger(context.id)) return;
+  const contexts = runtimeExecutionContexts.get(tabId) || new Map();
+  contexts.set(context.id, context);
+  runtimeExecutionContexts.set(tabId, contexts);
+  const waiters = runtimeContextWaiters.get(tabId);
+  if (!waiters) return;
+  for (const waiter of [...waiters]) {
+    if (context.auxData?.isDefault && context.auxData?.frameId === waiter.frameId) {
+      waiters.delete(waiter);
+      clearTimeout(waiter.timer);
+      waiter.resolve(context.id);
+    }
+  }
+  if (!waiters.size) runtimeContextWaiters.delete(tabId);
+}
+
+function forgetRuntimeExecutionContext(tabId, executionContextId) {
+  const contexts = runtimeExecutionContexts.get(tabId);
+  if (!contexts) return;
+  contexts.delete(executionContextId);
+  if (!contexts.size) runtimeExecutionContexts.delete(tabId);
+}
+
+function defaultRuntimeExecutionContext(tabId, frameId) {
+  const contexts = runtimeExecutionContexts.get(tabId);
+  if (!contexts) return null;
+  for (const context of contexts.values()) {
+    if (context.auxData?.isDefault && context.auxData?.frameId === frameId) {
+      return context.id;
+    }
+  }
+  return null;
+}
+
+async function waitForDefaultRuntimeExecutionContext(tabId, frameId, timeoutMs = 1000) {
+  const current = defaultRuntimeExecutionContext(tabId, frameId);
+  if (current !== null) return current;
+  return await new Promise((resolve, reject) => {
+    const waiters = runtimeContextWaiters.get(tabId) || new Set();
+    const waiter = { frameId, resolve, reject, timer: null };
+    waiter.timer = setTimeout(() => {
+      waiters.delete(waiter);
+      if (!waiters.size) runtimeContextWaiters.delete(tabId);
+      reject(new Error('manual execution could not resolve the MAIN execution context'));
+    }, timeoutMs);
+    waiters.add(waiter);
+    runtimeContextWaiters.set(tabId, waiters);
+  });
+}
+
+// --- Bounded, tab-scoped Network and Console capture ----------------------
+function boundedCaptureInteger(value, fallback, minimum, maximum) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed)
+    ? Math.max(minimum, Math.min(Math.floor(parsed), maximum))
+    : fallback;
+}
+
+function truncateCaptureText(value, maxBytes) {
+  const text = String(value ?? '');
+  const bytes = new TextEncoder().encode(text);
+  if (bytes.length <= maxBytes) {
+    return { value: text, size: bytes.length, truncated: false };
+  }
+  return {
+    value: new TextDecoder().decode(bytes.slice(0, maxBytes)),
+    size: bytes.length,
+    truncated: true,
+  };
+}
+
+function truncateCaptureBody(body, base64Encoded, maxBytes) {
+  if (base64Encoded) {
+    const text = String(body ?? '');
+    const maxChars = Math.max(4, Math.floor(maxBytes / 3) * 4);
+    return {
+      body: text.slice(0, maxChars),
+      body_size: Math.floor(text.length * 3 / 4),
+      body_truncated: text.length > maxChars,
+      base64_encoded: true,
+    };
+  }
+  const truncated = truncateCaptureText(body, maxBytes);
+  return {
+    body: truncated.value,
+    body_size: truncated.size,
+    body_truncated: truncated.truncated,
+    base64_encoded: false,
+  };
+}
+
+function pushCaptureEntry(capture, entry) {
+  if (capture.entries.length >= capture.maxEntries) {
+    const removed = capture.entries.shift();
+    if (removed && capture.byRequestId?.get(removed.request_id) === removed) {
+      capture.byRequestId.delete(removed.request_id);
+    }
+    capture.dropped += 1;
+  }
+  capture.entries.push(entry);
+}
+
+function networkCaptureSnapshot(capture, includeRequests = true) {
+  const result = {
+    status: capture.active ? 'capturing' : 'stopped',
+    tab_id: capture.tabId,
+    started_at: capture.startedAt,
+    stopped_at: capture.stoppedAt,
+    request_count: capture.entries.length,
+    dropped: capture.dropped,
+    body_errors: capture.bodyErrors,
+    include_bodies: capture.includeBodies,
+    max_entries: capture.maxEntries,
+    max_body_bytes: capture.maxBodyBytes,
+  };
+  if (capture.lastError) result.error = capture.lastError;
+  if (includeRequests) result.requests = capture.entries;
+  return result;
+}
+
+function consoleCaptureSnapshot(capture, includeMessages = true) {
+  const result = {
+    status: capture.active ? 'capturing' : 'stopped',
+    tab_id: capture.tabId,
+    started_at: capture.startedAt,
+    stopped_at: capture.stoppedAt,
+    message_count: capture.messages.length,
+    dropped: capture.dropped,
+    max_entries: capture.maxEntries,
+  };
+  if (capture.lastError) result.error = capture.lastError;
+  if (includeMessages) result.messages = capture.messages;
+  return result;
+}
+
+function markCaptureTabInvalidated(tabId, reason) {
+  const stoppedAt = Date.now();
+  for (const capture of [networkCaptures.get(tabId), consoleCaptures.get(tabId)]) {
+    if (!capture) continue;
+    capture.active = false;
+    capture.stoppedAt ||= stoppedAt;
+    capture.lastError = reason || 'debugger detached';
+    capture.debuggerLease = null;
+  }
+}
+
+function handleNetworkCaptureEvent(tabId, method, params = {}) {
+  const capture = networkCaptures.get(tabId);
+  if (!capture?.active) return;
+  if (method === 'Network.requestWillBeSent') {
+    const postData = params.request?.postData === undefined
+      ? null : truncateCaptureText(params.request.postData, Math.min(capture.maxBodyBytes, 65536));
+    const entry = {
+      request_id: params.requestId,
+      url: params.request?.url || '',
+      method: params.request?.method || '',
+      type: params.type || '',
+      timestamp: params.timestamp,
+      wall_time: params.wallTime,
+      document_url: params.documentURL || '',
+      request_headers: params.request?.headers || {},
+    };
+    if (postData) {
+      entry.post_data = postData.value;
+      entry.post_data_size = postData.size;
+      entry.post_data_truncated = postData.truncated;
+    }
+    pushCaptureEntry(capture, entry);
+    capture.byRequestId.set(params.requestId, entry);
+    return;
+  }
+  const entry = capture.byRequestId.get(params.requestId);
+  if (!entry) return;
+  if (method === 'Network.responseReceived') {
+    entry.status = params.response?.status;
+    entry.status_text = params.response?.statusText || '';
+    entry.mime_type = params.response?.mimeType || '';
+    entry.protocol = params.response?.protocol || '';
+    entry.response_headers = params.response?.headers || {};
+    entry.from_disk_cache = Boolean(params.response?.fromDiskCache);
+    entry.from_service_worker = Boolean(params.response?.fromServiceWorker);
+    return;
+  }
+  if (method === 'Network.loadingFailed') {
+    entry.failed = true;
+    entry.error_text = params.errorText || 'request failed';
+    entry.canceled = Boolean(params.canceled);
+    return;
+  }
+  if (method !== 'Network.loadingFinished') return;
+  entry.encoded_data_length = params.encodedDataLength;
+  entry.finished = true;
+  if (!capture.includeBodies) return;
+  const bodyPromise = (async () => {
+    try {
+      const result = await sendDebuggerCommandWithTimeout(
+        capture.debuggerLease,
+        'Network.getResponseBody',
+        { requestId: params.requestId },
+        capture.bodyTimeoutMs,
+      );
+      if (networkCaptures.get(tabId) !== capture) return;
+      Object.assign(
+        entry,
+        truncateCaptureBody(result?.body, Boolean(result?.base64Encoded), capture.maxBodyBytes),
+      );
+    } catch (error) {
+      entry.body_error = error.message || String(error);
+      capture.bodyErrors += 1;
+      if (debuggerFailureCode(error) === 'cdp_timeout') {
+        capture.active = false;
+        capture.stoppedAt ||= Date.now();
+        capture.lastError = entry.body_error;
+      }
+    }
+  })();
+  capture.pendingBodies.add(bodyPromise);
+  void bodyPromise.finally(() => capture.pendingBodies.delete(bodyPromise));
+}
+
+function captureRemoteObject(value) {
+  if (!value || typeof value !== 'object') return value ?? null;
+  if (Object.prototype.hasOwnProperty.call(value, 'value')) return value.value;
+  if (value.unserializableValue !== undefined) return value.unserializableValue;
+  const preview = truncateCaptureText(value.description || value.className || value.type || '', 4096);
+  return preview.value;
+}
+
+function handleConsoleCaptureEvent(tabId, method, params = {}) {
+  const capture = consoleCaptures.get(tabId);
+  if (!capture?.active) return;
+  let message = null;
+  if (method === 'Runtime.consoleAPICalled') {
+    const args = (params.args || []).map(captureRemoteObject);
+    message = {
+      type: params.type || 'log',
+      timestamp: params.timestamp,
+      args,
+      text: truncateCaptureText(args.map(value => String(value)).join(' '), 8192).value,
+      execution_context_id: params.executionContextId,
+      stack_trace: params.stackTrace || null,
+    };
+  } else if (method === 'Runtime.exceptionThrown') {
+    const details = params.exceptionDetails || {};
+    message = {
+      type: 'exception',
+      timestamp: params.timestamp,
+      text: truncateCaptureText(
+        details.exception?.description || details.text || 'Uncaught exception', 8192,
+      ).value,
+      url: details.url || '',
+      line_number: details.lineNumber,
+      column_number: details.columnNumber,
+      stack_trace: details.stackTrace || null,
+    };
+  }
+  if (!message) return;
+  if (capture.messages.length >= capture.maxEntries) {
+    capture.messages.shift();
+    capture.dropped += 1;
+  }
+  capture.messages.push(message);
+}
+
+async function handleNetworkCaptureCommand(msg, sender) {
+  const tabId = Number(msg.tabId || sender.tab?.id);
+  if (!Number.isInteger(tabId)) {
+    return { ok: false, code: 'invalid_tab_id', error: 'network_capture requires tabId' };
+  }
+  if (msg.method === 'start') {
+    const existing = networkCaptures.get(tabId);
+    if (existing?.active) {
+      return { ok: true, data: { ...networkCaptureSnapshot(existing, false), already_running: true } };
+    }
+    if (existing) networkCaptures.delete(tabId);
+    let debuggerLease = null;
+    const capture = {
+      tabId,
+      debuggerLease: null,
+      active: true,
+      startedAt: Date.now(),
+      stoppedAt: null,
+      maxEntries: boundedCaptureInteger(msg.maxEntries, 500, 10, 2000),
+      maxBodyBytes: boundedCaptureInteger(msg.maxBodyBytes, 262144, 1024, 2097152),
+      bodyTimeoutMs: boundedCaptureInteger(msg.bodyTimeoutMs, 5000, 100, 10000),
+      includeBodies: msg.includeBodies !== false,
+      entries: [],
+      byRequestId: new Map(),
+      pendingBodies: new Set(),
+      dropped: 0,
+      bodyErrors: 0,
+      lastError: null,
+    };
+    try {
+      debuggerLease = await attachAbmDebugger({ tabId });
+      capture.debuggerLease = debuggerLease;
+      networkCaptures.set(tabId, capture);
+      await sendDebuggerCommandWithTimeout(debuggerLease, 'Network.enable', {
+        maxTotalBufferSize: 10000000,
+        maxResourceBufferSize: 2000000,
+        maxPostDataSize: Math.min(capture.maxBodyBytes, 65536),
+      }, boundedCdpTimeout(msg.timeoutMs, 10000));
+      return { ok: true, data: networkCaptureSnapshot(capture, false) };
+    } catch (error) {
+      if (networkCaptures.get(tabId) === capture) networkCaptures.delete(tabId);
+      if (debuggerLease) try { await detachAbmDebugger(debuggerLease); } catch (_) {}
+      return {
+        ok: false,
+        code: debuggerFailureCode(error),
+        error: error.message || String(error),
+      };
+    }
+  }
+  if (msg.method === 'stop') {
+    const capture = networkCaptures.get(tabId);
+    if (!capture) return { ok: true, data: { status: 'not_running', tab_id: tabId, requests: [] } };
+    capture.active = false;
+    capture.stoppedAt ||= Date.now();
+    const lease = capture.debuggerLease;
+    capture.debuggerLease = null;
+    // Remove it before an intentional final detach can emit onDetach. That
+    // event invalidates captures still present in the map; a normal stop must
+    // not be mislabeled as an unexpected "debugger detached" failure.
+    networkCaptures.delete(tabId);
+    // Release this capture's lease before waiting for response bodies. That
+    // synchronously rejects only commands owned by this lease and clears their
+    // watchdogs, so a late body timeout cannot invalidate another capture that
+    // is sharing the same debugger attachment (for example Console capture).
+    if (lease) try { await detachAbmDebugger(lease); } catch (_) {}
+    if (capture.pendingBodies.size) {
+      await Promise.allSettled([...capture.pendingBodies]);
+    }
+    return { ok: true, data: networkCaptureSnapshot(capture, true) };
+  }
+  return { ok: false, code: 'unknown_method', error: `Unknown network_capture method: ${msg.method}` };
+}
+
+async function handleConsoleCaptureCommand(msg, sender) {
+  const tabId = Number(msg.tabId || sender.tab?.id);
+  if (!Number.isInteger(tabId)) {
+    return { ok: false, code: 'invalid_tab_id', error: 'console requires tabId' };
+  }
+  if (msg.method === 'start') {
+    const existing = consoleCaptures.get(tabId);
+    if (existing?.active) {
+      return { ok: true, data: { ...consoleCaptureSnapshot(existing, false), already_running: true } };
+    }
+    if (existing) consoleCaptures.delete(tabId);
+    let debuggerLease = null;
+    const capture = {
+      tabId,
+      debuggerLease: null,
+      active: true,
+      startedAt: Date.now(),
+      stoppedAt: null,
+      maxEntries: boundedCaptureInteger(msg.maxEntries, 500, 10, 5000),
+      messages: [],
+      dropped: 0,
+      lastError: null,
+    };
+    try {
+      debuggerLease = await attachAbmDebugger({ tabId });
+      capture.debuggerLease = debuggerLease;
+      consoleCaptures.set(tabId, capture);
+      await sendDebuggerCommandWithTimeout(
+        debuggerLease, 'Runtime.enable', {}, boundedCdpTimeout(msg.timeoutMs, 10000),
+      );
+      return { ok: true, data: consoleCaptureSnapshot(capture, false) };
+    } catch (error) {
+      if (consoleCaptures.get(tabId) === capture) consoleCaptures.delete(tabId);
+      if (debuggerLease) try { await detachAbmDebugger(debuggerLease); } catch (_) {}
+      return {
+        ok: false,
+        code: debuggerFailureCode(error),
+        error: error.message || String(error),
+      };
+    }
+  }
+  const capture = consoleCaptures.get(tabId);
+  if (msg.method === 'get') {
+    if (!capture) {
+      return { ok: true, data: { status: 'not_running', tab_id: tabId, messages: [] } };
+    }
+    const offset = boundedCaptureInteger(msg.offset, 0, 0, capture.messages.length);
+    const maxItems = boundedCaptureInteger(msg.maxItems, 200, 1, 1000);
+    const total = capture.messages.length;
+    const messages = capture.messages.slice(offset, offset + maxItems);
+    const data = {
+      ...consoleCaptureSnapshot(capture, false),
+      messages,
+      offset,
+      total,
+      next_offset: offset + messages.length < total ? offset + messages.length : null,
+      truncated: offset + messages.length < total,
+    };
+    if (msg.clear === true) {
+      data.cleared = capture.messages.length;
+      capture.messages.splice(0, capture.messages.length);
+    }
+    return { ok: true, data };
+  }
+  if (msg.method === 'stop') {
+    if (!capture) return { ok: true, data: { status: 'not_running', tab_id: tabId, messages: [] } };
+    capture.active = false;
+    capture.stoppedAt ||= Date.now();
+    consoleCaptures.delete(tabId);
+    const lease = capture.debuggerLease;
+    capture.debuggerLease = null;
+    if (lease) try { await detachAbmDebugger(lease); } catch (_) {}
+    return { ok: true, data: consoleCaptureSnapshot(capture, true) };
+  }
+  return { ok: false, code: 'unknown_method', error: `Unknown console method: ${msg.method}` };
+}
+
+function handleDebuggerEvent(source, method, params) {
+  const tabId = source.tabId;
+  if (!tabId || !dialogAttachedTabs.has(tabId)) return;
+  if (typeof handleNetworkCaptureEvent === 'function') {
+    handleNetworkCaptureEvent(tabId, method, params);
+  }
+  if (typeof handleConsoleCaptureEvent === 'function') {
+    handleConsoleCaptureEvent(tabId, method, params);
+  }
+  if (method === 'Runtime.executionContextCreated') {
+    rememberRuntimeExecutionContext(tabId, params?.context);
+    return;
+  }
+  if (method === 'Runtime.executionContextDestroyed') {
+    const pending = pendingManualExecutions.get(tabId);
+    if (pending?.evaluationStarted &&
+        pending.executionContextId === params?.executionContextId) {
+      void cancelManualExecution(tabId, 'manual execution context was destroyed');
+    }
+    forgetRuntimeExecutionContext(tabId, params?.executionContextId);
+    return;
+  }
+  if (method === 'Runtime.executionContextsCleared') {
+    runtimeExecutionContexts.delete(tabId);
+    const pending = pendingManualExecutions.get(tabId);
+    if (pending?.evaluationStarted) {
+      void cancelManualExecution(tabId, 'manual execution contexts were cleared');
+    }
+    return;
+  }
+  if (method === 'Page.frameNavigated') {
+    if (params?.frame && !params.frame.parentId) {
+      const pending = pendingManualExecutions.get(tabId);
+      if (pending?.evaluationStarted) {
+        void cancelManualExecution(tabId, 'manual tab navigated');
+      }
+    }
+    return;
+  }
+  if (method === 'Page.javascriptDialogClosed') {
+    protocolDialogStates.delete(tabId);
+    return;
+  }
+  if (method !== 'Page.javascriptDialogOpening') return;
+  const eventSequence = (dialogEventSequences.get(tabId) || 0) + 1;
+  dialogEventSequences.set(tabId, eventSequence);
+  const dialog = rememberProtocolDialog(tabId, params || {});
+  const manualPending = pendingManualExecutions.get(tabId);
+  if (manualPending &&
+      pendingManualExecutions.get(tabId) === manualPending &&
+      manualExecutionGenerations.get(tabId) === manualPending.generation &&
+      manualPending.state === 'armed' && !manualPending.released &&
+      !manualPending.dialog) {
+    if (Date.now() > manualPending.deadline) {
+      void cancelManualExecution(
+        tabId, 'manual dialog ownership expired before opening', manualPending,
+      );
+    } else if (eventSequence >= manualPending.eventFloor) {
+      manualPending.dialog = dialog;
+      manualPending.state = 'dialog';
+      if (manualPending.expiryTimer) clearTimeout(manualPending.expiryTimer);
+      manualPending.resolveDialog({ kind: 'dialog', dialog });
+    }
+  }
+  const navigationPending = pendingNavigations.get(tabId);
+  if (!navigationPending) return;
+  navigationPending.dialog = dialog;
+  if (navigationPending.action === 'manual') {
+    navigationPending.manualOwned = true;
+    scheduleManualNavigationRelease(navigationPending);
+  }
+  if (navigationPending.action !== 'manual') {
+    navigationPending.handlePromise = sendDebuggerCommandWithTimeout(
+      navigationPending.debuggerLease,
+      'Page.handleJavaScriptDialog',
+      { accept: navigationPending.action === 'accept' },
+      3000,
+    ).then(() => { navigationPending.handled = true; }).catch((error) => {
+      navigationPending.handleError = error.message || String(error);
+    });
+  }
+  navigationPending.resolve(dialog);
+}
+
+chrome.debugger.onEvent.addListener(handleDebuggerEvent);
+
+chrome.debugger.onDetach.addListener((source) => {
+  if (!source.tabId) return;
+  const key = debuggerTargetKey(source);
+  const attachment = debuggerAttachments.get(key);
+  if (attachment) {
+    attachment.attached = false;
+    attachment.invalidated = true;
+    attachment.invalidationReason = 'debugger detached';
+    attachment.refs = 0;
+    rejectPendingDebuggerCommands(attachment, 'debugger detached');
+    if (debuggerAttachments.get(key) === attachment) {
+      debuggerAttachments.delete(key);
+    }
+  }
+  dialogAttachedTabs.delete(source.tabId);
+  protocolDialogStates.delete(source.tabId);
+  const navigationPending = pendingNavigations.get(source.tabId) || null;
+  dialogEventSequences.delete(source.tabId);
+  manualExecutionGenerations.delete(source.tabId);
+  runtimeExecutionContexts.delete(source.tabId);
+  if (typeof markCaptureTabInvalidated === 'function') {
+    markCaptureTabInvalidated(source.tabId, 'debugger detached');
+  }
+  if (navigationPending) {
+    void cancelNavigationPending(
+      source.tabId, 'debugger detached', navigationPending,
+    );
+  }
+  void cancelManualExecution(source.tabId, 'debugger detached');
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  const attachment = debuggerAttachments.get(`tab:${tabId}`);
+  if (attachment) {
+    attachment.invalidationReason = 'tab removed';
+    attachment.refs = 0;
+    rejectPendingDebuggerCommands(attachment, 'tab removed');
+    debuggerAttachments.delete(`tab:${tabId}`);
+  }
+  dialogAttachedTabs.delete(tabId);
+  protocolDialogStates.delete(tabId);
+  const navigationPending = pendingNavigations.get(tabId) || null;
+  dialogEventSequences.delete(tabId);
+  manualExecutionGenerations.delete(tabId);
+  execDialogPolicies.delete(tabId);
+  runtimeExecutionContexts.delete(tabId);
+  if (typeof networkCaptures !== 'undefined') networkCaptures.delete(tabId);
+  if (typeof consoleCaptures !== 'undefined') consoleCaptures.delete(tabId);
+  if (navigationPending) {
+    void cancelNavigationPending(tabId, 'tab removed', navigationPending);
+  }
+  void cancelManualExecution(tabId, 'tab removed');
+});
+
+function currentExecDialogPolicy(tabId, token) {
+  const scopes = execDialogPolicies.get(tabId);
+  if (!scopes) return null;
+  const now = Date.now();
+  for (const [token, entry] of scopes) {
+    if (entry.expiresAt <= now) scopes.delete(token);
+  }
+  if (!scopes.size) {
+    execDialogPolicies.delete(tabId);
+    return null;
+  }
+  return token ? (scopes.get(token) || null) : null;
+}
+
+function claimManualExecDialogPolicy(tabId, source) {
+  if (typeof source !== 'string') return null;
+  const scopes = execDialogPolicies.get(tabId);
+  if (!scopes) return null;
+  const now = Date.now();
+  for (const [token, entry] of scopes) {
+    if (entry.expiresAt <= now) {
+      scopes.delete(token);
+      continue;
+    }
+    if (entry.policy === 'manual' && !entry.claimed && entry.source === source) {
+      entry.claimed = true;
+      return entry;
+    }
+  }
+  if (!scopes.size) execDialogPolicies.delete(tabId);
+  return null;
+}
+
+function debuggerTargetKey(target) {
+  if (target.tabId) return `tab:${target.tabId}`;
+  if (target.targetId) return `target:${target.targetId}`;
+  if (target.extensionId) return `extension:${target.extensionId}`;
+  throw new Error('debugger target is missing an identifier');
+}
+
+function boundedCdpTimeout(value, fallback = 20000) {
+  const requested = Number(value);
+  return Number.isFinite(requested) && requested > 0
+    ? Math.max(100, Math.min(Math.floor(requested), 120000))
+    : fallback;
+}
+
+function debuggerFailureCode(error) {
+  const message = String(error?.message || error || '').toLowerCase();
+  if (error?.code === 'cdp_timeout' || message.includes('cdp_timeout')) return 'cdp_timeout';
+  if (message.includes('another debugger') || message.includes('already attached')) {
+    return 'debugger_conflict';
+  }
+  if (message.includes('detached') || message.includes('not attached')) return 'debugger_detached';
+  return 'cdp_error';
+}
+
+function clearDebuggerTabState(tabId, reason) {
+  if (!tabId) return;
+  dialogAttachedTabs.delete(tabId);
+  protocolDialogStates.delete(tabId);
+  dialogEventSequences.delete(tabId);
+  runtimeExecutionContexts.delete(tabId);
+  execDialogPolicies.delete(tabId);
+  if (typeof markCaptureTabInvalidated === 'function') {
+    markCaptureTabInvalidated(tabId, reason);
+  }
+  if (typeof cancelNavigationPending === 'function') {
+    void cancelNavigationPending(tabId, reason);
+  }
+  if (typeof cancelManualExecution === 'function') {
+    void cancelManualExecution(tabId, reason);
+  }
+}
+
+function rejectPendingDebuggerCommands(attachment, reason, excludedCommand = null) {
+  if (!attachment?.pendingCommands) return;
+  for (const command of [...attachment.pendingCommands]) {
+    if (command === excludedCommand || command.settled) continue;
+    command.settled = true;
+    if (command.timer !== null) {
+      clearTimeout(command.timer);
+      command.timer = null;
+    }
+    attachment.pendingCommands.delete(command);
+    const error = new Error(`debugger_detached: ${reason || 'attachment released'}`);
+    error.code = 'debugger_detached';
+    command.reject(error);
+  }
+}
+
+function rejectPendingDebuggerCommandsForLease(attachment, lease, reason) {
+  if (!attachment?.pendingCommands || !lease) return;
+  for (const command of [...attachment.pendingCommands]) {
+    if (command.lease !== lease || command.settled) continue;
+    command.settled = true;
+    if (command.timer !== null) {
+      clearTimeout(command.timer);
+      command.timer = null;
+    }
+    attachment.pendingCommands.delete(command);
+    const error = new Error(`debugger_detached: ${reason || 'lease released'}`);
+    error.code = 'debugger_detached';
+    command.reject(error);
+  }
+}
+
+async function attachAbmDebugger(target) {
+  const key = debuggerTargetKey(target);
+  const activeRecovery = debuggerRecoveryPromises.get(key);
+  if (activeRecovery) {
+    await activeRecovery;
+    return await attachAbmDebugger(target);
+  }
+  let attachment = debuggerAttachments.get(key);
+  if (attachment?.detachingPromise) {
+    try { await attachment.detachingPromise; } catch (_) {}
+    return await attachAbmDebugger(target);
+  }
+  if (!attachment) {
+    attachment = {
+      key,
+      target: { ...target },
+      refs: 0,
+      attached: false,
+      invalidated: false,
+      invalidationReason: null,
+      generation: `${Date.now()}-${Math.random()}`,
+      detachingPromise: null,
+      attachPromise: null,
+      pendingCommands: new Set(),
+    };
+    debuggerAttachments.set(key, attachment);
+    const rawAttach = () => chrome.debugger.attach(attachment.target, '1.3');
+    attachment.attachPromise = Promise.resolve()
+      .then(rawAttach)
+      .catch(async (error) => {
+        if (debuggerFailureCode(error) !== 'debugger_conflict') throw error;
+        // A service-worker restart can lose our in-memory lease map while
+        // Chrome still considers this extension attached. Detach is scoped to
+        // this extension; it cannot take ownership from a different extension.
+        const waitingRefs = attachment.refs;
+        const recovery = (async () => {
+          attachment.attached = true;
+          try {
+            await detachAbmDebugger({ attachment, released: false }, true);
+          } catch (_) {
+            // If DevTools or another extension owns the target, our detach is
+            // rejected as "not attached". Preserve the original conflict so
+            // callers get the correct close-the-competing-debugger guidance.
+            throw error;
+          }
+          attachment.invalidated = false;
+          attachment.invalidationReason = null;
+          attachment.detachingPromise = null;
+          // Every caller awaiting this shared attachPromise already owns one
+          // reference. force-detach clears refs while recovering Chrome's stale
+          // attachment, so restore them before those leases begin issuing work.
+          attachment.refs = waitingRefs;
+          debuggerAttachments.set(key, attachment);
+          await rawAttach();
+        })();
+        debuggerRecoveryPromises.set(key, recovery);
+        try {
+          await recovery;
+        } finally {
+          if (debuggerRecoveryPromises.get(key) === recovery) {
+            debuggerRecoveryPromises.delete(key);
+          }
+        }
+      })
+      .then(() => {
+        attachment.attached = true;
+        if (attachment.target.tabId) dialogAttachedTabs.add(attachment.target.tabId);
+      });
+  }
+  attachment.refs += 1;
+  const lease = { attachment, generation: attachment.generation, released: false };
+  try {
+    await attachment.attachPromise;
+    return lease;
+  } catch (error) {
+    lease.released = true;
+    attachment.refs = Math.max(0, attachment.refs - 1);
+    if (!attachment.refs && debuggerAttachments.get(key) === attachment) {
+      debuggerAttachments.delete(key);
+    }
+    throw error;
+  }
+}
+
+async function detachAbmDebugger(lease, force = false, excludedCommand = null) {
+  if (!lease?.attachment || lease.released) return;
+  lease.released = true;
+  const attachment = lease.attachment;
+  // Commands belong to the lease that started them. Releasing Network capture
+  // must cancel only its getResponseBody calls, not invalidate a shared Console
+  // lease later when an old watchdog fires.
+  rejectPendingDebuggerCommandsForLease(attachment, lease, 'owning lease released');
+  if (!force && (attachment.invalidated || lease.generation !== attachment.generation)) return;
+  attachment.refs = force ? 0 : Math.max(0, attachment.refs - 1);
+  if (attachment.refs || attachment.detachingPromise) return;
+  rejectPendingDebuggerCommands(
+    attachment,
+    attachment.invalidationReason || 'attachment released',
+    excludedCommand,
+  );
+  attachment.detachingPromise = (async () => {
+    try {
+      if (attachment.attached) {
+        await Promise.race([
+          chrome.debugger.detach(attachment.target),
+          new Promise(resolve => setTimeout(resolve, 1000)),
+        ]);
+      }
+    } finally {
+      attachment.attached = false;
+      if (debuggerAttachments.get(attachment.key) === attachment) {
+        debuggerAttachments.delete(attachment.key);
+        if (attachment.target.tabId) dialogAttachedTabs.delete(attachment.target.tabId);
+      }
+      if (attachment.target.tabId) {
+        protocolDialogStates.delete(attachment.target.tabId);
+      }
+    }
+  })();
+  await attachment.detachingPromise;
+}
+
+async function forceInvalidateDebuggerAttachment(
+  attachment, reason, triggeringCommand = null,
+) {
+  if (!attachment) return;
+  if (attachment.invalidatingPromise) return await attachment.invalidatingPromise;
+  attachment.invalidated = true;
+  attachment.invalidationReason = reason;
+  attachment.refs = 0;
+  if (debuggerAttachments.get(attachment.key) === attachment) {
+    debuggerAttachments.delete(attachment.key);
+  }
+  rejectPendingDebuggerCommands(attachment, reason, triggeringCommand);
+  if (attachment.target.tabId) clearDebuggerTabState(attachment.target.tabId, reason);
+  attachment.invalidatingPromise = detachAbmDebugger(
+    { attachment, generation: attachment.generation, released: false },
+    true,
+    triggeringCommand,
+  ).catch(() => {});
+  await attachment.invalidatingPromise;
+}
+
+async function sendDebuggerCommandWithTimeout(
+  lease, method, params = {}, timeoutMs = 20000,
+) {
+  if (!lease?.attachment || lease.released || lease.attachment.invalidated ||
+      lease.generation !== lease.attachment.generation) {
+    const error = new Error('debugger_detached: attachment lease is no longer valid');
+    error.code = 'debugger_detached';
+    throw error;
+  }
+  const attachment = lease.attachment;
+  const bounded = boundedCdpTimeout(timeoutMs);
+  const commandState = {
+    lease,
+    timer: null,
+    reject: null,
+    settled: false,
+  };
+  attachment.pendingCommands ||= new Set();
+  attachment.pendingCommands.add(commandState);
+  const command = Promise.resolve().then(
+    () => chrome.debugger.sendCommand(attachment.target, method, params || {}),
+  );
+  const watchdog = new Promise((_, reject) => {
+    commandState.reject = reject;
+    commandState.timer = setTimeout(async () => {
+      if (commandState.settled) return;
+      const reason = `cdp_timeout: ${method} exceeded ${bounded}ms`;
+      await forceInvalidateDebuggerAttachment(attachment, reason, commandState);
+      if (commandState.settled) return;
+      const error = new Error(reason);
+      error.code = 'cdp_timeout';
+      error.method = method;
+      error.timeoutMs = bounded;
+      reject(error);
+    }, bounded);
+  });
+  try {
+    return await Promise.race([command, watchdog]);
+  } catch (error) {
+    if (debuggerFailureCode(error) === 'debugger_conflict') {
+      await forceInvalidateDebuggerAttachment(
+        attachment, `debugger_conflict: ${error.message || String(error)}`,
+        commandState,
+      );
+    }
+    throw error;
+  } finally {
+    commandState.settled = true;
+    if (commandState.timer !== null) clearTimeout(commandState.timer);
+    commandState.timer = null;
+    attachment.pendingCommands.delete(commandState);
+  }
+}
+
+async function handleProtocolDialog(msg) {
+  const tabId = Number(msg.tabId);
+  const action = msg.action;
+  if (!Number.isInteger(tabId)) return { ok: false, error: 'handle_dialog requires tabId' };
+  if (!validDialogPolicy(action)) return { ok: false, error: 'invalid dialog action' };
+  let debuggerLease = null;
+  let borrowedNavigationLease = false;
+  let captured = null;
+  const owningManual = pendingManualExecutions.get(tabId) || null;
+  const owningNavigation = pendingNavigations.get(tabId) || null;
+  try {
+    // A manual navigation deliberately retains the exact lease that issued
+    // Page.navigate while its beforeunload dialog is open.  Re-attaching a
+    // second logical lease here works in the JS harness but real Chrome can
+    // reject Page.handleJavaScriptDialog with "Detached while handling
+    // command" while that navigation command is still paused.  Route the
+    // explicit accept/dismiss through the owning lease instead; it already has
+    // Page enabled and is released only after navigation + handledSignal settle.
+    if (owningNavigation?.action === 'manual' && owningNavigation.dialog &&
+        owningNavigation.debuggerLease && !owningNavigation.released) {
+      debuggerLease = owningNavigation.debuggerLease;
+      borrowedNavigationLease = true;
+    } else {
+      debuggerLease = await attachAbmDebugger({ tabId });
+      await sendDebuggerCommandWithTimeout(
+        debuggerLease, 'Page.enable', {}, boundedCdpTimeout(msg.timeoutMs, 2500),
+      );
+    }
+    await new Promise(resolve => setTimeout(resolve, 50));
+    captured = currentProtocolDialog(tabId) || owningManual?.dialog ||
+      owningNavigation?.dialog || null;
+    if (action === 'manual') {
+      return { ok: true, data: {
+        status: captured ? 'blocked_by_dialog' : 'no_dialog',
+        dialog: captured,
+        dialog_action: action,
+        dialog_observed: Boolean(captured),
+        handled: false,
+        pending_execution: Boolean(owningManual || owningNavigation),
+      } };
+    }
+    const params = {
+      accept: action === 'accept',
+      ...(msg.promptText !== undefined ? { promptText: msg.promptText } : {}),
+    };
+    await sendDebuggerCommandWithTimeout(
+      debuggerLease, 'Page.handleJavaScriptDialog', params,
+      boundedCdpTimeout(msg.timeoutMs, 2500),
+    );
+    if (owningNavigation?.action === 'manual' && !owningNavigation.handled &&
+        owningNavigation.dialog) {
+      owningNavigation.handled = true;
+      if (owningNavigation.resolveHandled) owningNavigation.resolveHandled({
+        kind: 'handled', action,
+      });
+      scheduleManualNavigationRelease(owningNavigation);
+    }
+    return { ok: true, data: {
+      status: 'ok', handled: true, dialog: captured, dialog_action: action,
+      dialog_observed: Boolean(captured),
+      pending_execution: pendingManualExecutions.has(tabId) ||
+        pendingNavigations.has(tabId),
+    } };
+  } catch (error) {
+    return { ok: false, error: error.message || String(error), dialog: captured };
+  } finally {
+    if (debuggerLease && !borrowedNavigationLease) {
+      try { await detachAbmDebugger(debuggerLease); } catch (_) {}
+    }
+  }
+}
+
+function classifyNavigationOutcome({
+  firstKind, navigationKind, dialog, action, handleError,
+}) {
+  if (handleError) return 'dialog_handle_failed';
+  if (dialog && action === 'manual') return 'blocked_by_dialog';
+  if (dialog?.type === 'beforeunload' && action === 'dismiss') {
+    return 'blocked_by_beforeunload';
+  }
+  if (firstKind === 'error' || navigationKind === 'error') return 'navigation_failed';
+  if (firstKind === 'timeout' || navigationKind === 'timeout') return 'navigation_timeout';
+  return 'ok';
+}
+
+async function releaseNavigationPending(pending) {
+  if (!pending) return;
+  if (pending.releasePromise) return await pending.releasePromise;
+  pending.released = true;
+  if (pending.releaseTimer) {
+    clearTimeout(pending.releaseTimer);
+    pending.releaseTimer = null;
+  }
+  if (pendingNavigations.get(pending.tabId) === pending) {
+    pendingNavigations.delete(pending.tabId);
+  }
+  const lease = pending.debuggerLease;
+  pending.debuggerLease = null;
+  pending.releasePromise = (async () => {
+    if (lease) {
+      try { await detachAbmDebugger(lease); } catch (_) {}
+    }
+  })();
+  await pending.releasePromise;
+}
+
+function scheduleManualNavigationRelease(pending) {
+  if (!pending || pending.releasePromise || pending.cleanupPromise ||
+      !pending.navigationPromise || !pending.handledSignal) return;
+  pending.cleanupPromise = Promise.all([
+    pending.navigationPromise,
+    pending.handledSignal,
+  ]).then(() => releaseNavigationPending(pending));
+}
+
+async function cancelNavigationPending(tabId, reason, expectedPending = null) {
+  const pending = pendingNavigations.get(tabId);
+  if (!pending || (expectedPending && pending !== expectedPending)) return false;
+  pending.cancelReason = reason;
+  if (pending.resolveCancel) pending.resolveCancel({ kind: 'cancelled', reason });
+  await releaseNavigationPending(pending);
+  return true;
+}
+
+async function navigateWithDialogPolicy(msg) {
+  const tabId = Number(msg.tabId);
+  const action = msg.beforeunload;
+  if (!Number.isInteger(tabId)) return { ok: false, error: 'navigate requires tabId' };
+  if (!validDialogPolicy(action)) return { ok: false, error: 'invalid beforeunload action' };
+  let debuggerLease = null;
+  let pending = null;
+  try {
+    const beforeTab = await chrome.tabs.get(tabId);
+    debuggerLease = await attachAbmDebugger({ tabId });
+    await sendDebuggerCommandWithTimeout(
+      debuggerLease, 'Page.enable', {}, boundedCdpTimeout(msg.timeoutMs),
+    );
+    let resolveDialog;
+    const dialogPromise = new Promise(resolve => { resolveDialog = resolve; });
+    let resolveHandled;
+    let resolveCancel;
+    pending = {
+      tabId,
+      action,
+      dialog: null,
+      resolve: resolveDialog,
+      handlePromise: null,
+      handled: false,
+      manualOwned: false,
+      debuggerLease,
+      released: false,
+      resolveHandled,
+      resolveCancel,
+    };
+    pending.handledSignal = new Promise(resolve => { resolveHandled = resolve; });
+    pending.resolveHandled = resolveHandled;
+    pending.cancelSignal = new Promise(resolve => { resolveCancel = resolve; });
+    pending.resolveCancel = resolveCancel;
+    pendingNavigations.set(tabId, pending);
+    const navigationPromise = sendDebuggerCommandWithTimeout(
+      debuggerLease, 'Page.navigate', { url: msg.url },
+      boundedCdpTimeout(msg.timeoutMs),
+    ).then(value => ({ kind: 'navigation', value })).catch(error => ({
+      kind: 'error', error: error.message || String(error),
+    }));
+    pending.navigationPromise = navigationPromise;
+    const waitMs = Math.max(100, Math.min(Number(msg.timeoutMs) || 15000, 30000));
+    let first = await Promise.race([
+      navigationPromise,
+      dialogPromise.then(dialog => ({ kind: 'dialog', dialog })),
+      pending.cancelSignal,
+      new Promise(resolve => setTimeout(() => resolve({ kind: 'timeout' }), waitMs)),
+    ]);
+    // Page.navigate can resolve just before the dialog event is delivered.
+    if (first.kind === 'navigation' && !pending.dialog) {
+      first = await Promise.race([
+        dialogPromise.then(dialog => ({ kind: 'dialog', dialog })),
+        new Promise(resolve => setTimeout(() => resolve(first), 250)),
+      ]);
+    }
+    const dialog = pending.dialog || (first.kind === 'dialog' ? first.dialog : null);
+    if (dialog && action === 'manual') {
+      pending.manualOwned = true;
+      scheduleManualNavigationRelease(pending);
+    }
+    if (pending.handlePromise) await pending.handlePromise;
+    let navigation = first.kind === 'navigation' ? first.value : null;
+    let navigationKind = first.kind;
+    let navigationError = first.kind === 'error' ? first.error : null;
+    if (dialog && action === 'accept') {
+      const completed = await Promise.race([
+        navigationPromise,
+        new Promise(resolve => setTimeout(() => resolve({ kind: 'timeout' }), 3000)),
+      ]);
+      navigationKind = completed.kind;
+      navigationError = completed.kind === 'error' ? completed.error : null;
+      if (completed.kind === 'navigation') navigation = completed.value;
+    }
+    let tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (!dialog || action === 'accept') {
+      const settleUntil = Date.now() + 3000;
+      while (tab && Date.now() < settleUntil) {
+        const currentUrl = tab.pendingUrl || tab.url || '';
+        if (currentUrl && (currentUrl !== beforeTab.url || currentUrl === msg.url)) break;
+        await new Promise(resolve => setTimeout(resolve, 100));
+        tab = await chrome.tabs.get(tabId).catch(() => tab);
+      }
+    }
+    const status = classifyNavigationOutcome({
+      firstKind: first.kind,
+      navigationKind,
+      dialog,
+      action,
+      handleError: pending.handleError,
+    });
+    return {
+      ok: true,
+      data: {
+        status,
+        dialog,
+        dialog_action: dialog ? action : undefined,
+        dialog_observed: Boolean(dialog),
+        handled: Boolean(pending.handled),
+        handle_error: pending.handleError,
+        navigation,
+        navigation_error: navigationError,
+        url: status === 'blocked_by_beforeunload'
+          ? (tab?.url || msg.url)
+          : (tab?.pendingUrl || tab?.url || msg.url),
+        title: tab?.title || '',
+        pending_execution: Boolean(
+          dialog && action === 'manual' && !pending.released,
+        ),
+      },
+    };
+  } catch (error) {
+    return { ok: false, error: error.message || String(error), dialog: pending?.dialog || null };
+  } finally {
+    const retainManualOwner = Boolean(
+      pending && pending.action === 'manual' && pending.manualOwned &&
+      !pending.released && pendingNavigations.get(tabId) === pending
+    );
+    if (!retainManualOwner) {
+      if (pending) await releaseNavigationPending(pending);
+      else if (debuggerLease) {
+        try { await detachAbmDebugger(debuggerLease); } catch (_) {}
+      }
+    } else {
+      debuggerLease = null;
+    }
+  }
+}
+
 async function handleExtMessage(msg, sender) {
+  if (msg.cmd === 'site_permission') {
+    // Keep operation failures in a successful bridge envelope so the server
+    // can return structured unsupported/error results instead of losing them
+    // in TMWebDriver's generic extension exception path.
+    if (msg.action === 'set') return { ok: true, data: await setSitePermission(msg) };
+    if (msg.action === 'reset') return { ok: true, data: await resetSitePermissionLeases(msg) };
+    return { ok: true, data: { ok: false, error: 'invalid site permission action' } };
+  }
+  if (msg.cmd === 'dialog_state') {
+    const tabId = Number(msg.tabId);
+    if (!Number.isInteger(tabId)) return { ok: false, error: 'dialog_state requires tabId' };
+    return { ok: true, data: { dialog: currentProtocolDialog(tabId) } };
+  }
+  if (msg.cmd === 'handle_dialog') return await handleProtocolDialog(msg);
+  if (msg.cmd === 'navigate') return await navigateWithDialogPolicy(msg);
+  if (msg.cmd === 'set_dialog_policy') {
+    const tabId = Number(msg.tabId);
+    if (!Number.isInteger(tabId)) return { ok: false, error: 'set_dialog_policy requires tabId' };
+    if (!validDialogPolicy(msg.policy)) return { ok: false, error: 'invalid dialog policy' };
+    const token = `${Date.now()}-${nextDialogScope++}`;
+    const requestedTimeout = Number(msg.timeoutMs);
+    const timeoutMs = Number.isFinite(requestedTimeout) && requestedTimeout > 0
+      ? Math.min(Math.floor(requestedTimeout), 120000) : 15000;
+    const scopes = execDialogPolicies.get(tabId) || new Map();
+    scopes.set(token, {
+      token,
+      policy: msg.policy,
+      timeoutMs,
+      expiresAt: Date.now() + 120000,
+      source: msg.policy === 'manual' && typeof msg.source === 'string'
+        ? msg.source : null,
+      claimed: false,
+    });
+    execDialogPolicies.set(tabId, scopes);
+    return { ok: true, data: { token } };
+  }
+  if (msg.cmd === 'clear_dialog_policy') {
+    const tabId = Number(msg.tabId);
+    const scopes = execDialogPolicies.get(tabId);
+    if (scopes) {
+      if (msg.token !== undefined) scopes.delete(String(msg.token));
+      else scopes.clear();
+      if (!scopes.size) execDialogPolicies.delete(tabId);
+    }
+    return { ok: true, data: { cleared: true } };
+  }
   if (msg.cmd === 'cookies') return await handleCookies(msg, sender);
   if (msg.cmd === 'cdp') return await handleCDP(msg, sender);
   if (msg.cmd === 'batch') return await handleBatch(msg, sender);
@@ -48,8 +1729,22 @@ async function handleExtMessage(msg, sender) {
     try {
       if (msg.method === 'switch') {
         const tab = await chrome.tabs.update(msg.tabId, { active: true });
-        await chrome.windows.update(tab.windowId, { focused: true });
-        return { ok: true };
+        // A minimized window swallows the raise: the tab goes active, focused:true
+        // reports success, and the page still isn't on screen — so screen-coordinate
+        // clicks land on whatever is. Un-minimize first, then report what the
+        // window actually ended up as so the caller can tell.
+        const before = await chrome.windows.get(tab.windowId);
+        const update = { focused: true };
+        if (before.state === 'minimized') update.state = 'normal';
+        await chrome.windows.update(tab.windowId, update);
+        const after = await chrome.windows.get(tab.windowId);
+        return {
+          ok: true,
+          windowId: tab.windowId,
+          wasMinimized: before.state === 'minimized',
+          windowState: after.state,
+          onScreen: after.state !== 'minimized',
+        };
       } else if (msg.method === 'close') {
         // Works on chrome-extension:// pages too, which never become sessions
         // and so can't be closed through any session-scoped path.
@@ -59,8 +1754,28 @@ async function handleExtMessage(msg, sender) {
         // Native tab creation — runs in the SW, so it needs NO existing tab.
         // This replaces the old GM_openInTab path (a Tampermonkey API that
         // does not exist in a plain extension, so open_new_tab always threw).
-        const tab = await chrome.tabs.create({ url: msg.url || 'about:blank', active: msg.active !== false });
-        return { ok: true, data: { id: tab.id, url: tab.url || tab.pendingUrl || msg.url, title: tab.title, windowId: tab.windowId } };
+        let tab = await chrome.tabs.create({ url: msg.url || 'about:blank', active: msg.active !== false });
+        const pendingGeneration = tabGenerationAssignments.get(tab.id);
+        if (pendingGeneration) await pendingGeneration;
+        const waitMs = Math.max(100, Math.min(Number(msg.timeoutMs) || 15000, 30000));
+        const deadline = Date.now() + waitMs;
+        while (tab && Date.now() < deadline) {
+          const currentUrl = tab.pendingUrl || tab.url || '';
+          if (tab.status === 'complete' && currentUrl) break;
+          await new Promise(resolve => setTimeout(resolve, 100));
+          tab = await chrome.tabs.get(tab.id).catch(() => null);
+        }
+        if (tab) await sendTabsUpdate();
+        const currentUrl = tab?.pendingUrl || tab?.url || msg.url;
+        return { ok: true, data: {
+          id: tab?.id,
+          generation: await tabGenerationFor(tab.id),
+          url: currentUrl,
+          title: tab?.title || '',
+          windowId: tab?.windowId,
+          status: tab?.status || 'unknown',
+          load_ready: Boolean(tab && tab.status === 'complete' && currentUrl),
+        } };
       } else {
         // all:true also reveals chrome-extension:// pages. They never become
         // sessions (content scripts can't run there), but chrome.debugger CAN
@@ -82,15 +1797,34 @@ async function handleExtMessage(msg, sender) {
         extensionId: x.extensionId })) };
     } catch (e) { return { ok: false, error: e.message }; }
   }
+  if (msg.cmd === 'call_extension') {
+    try {
+      if (!msg.extId || typeof msg.extId !== 'string') {
+        return { ok: false, code: 'invalid_extension_id', error: 'call_extension requires extId' };
+      }
+      if (msg.extId === chrome.runtime.id) {
+        return {
+          ok: false,
+          code: 'self_message_unsupported',
+          error: 'call_extension targets another installed extension, not the ABM bridge itself',
+        };
+      }
+      const response = await chrome.runtime.sendMessage(msg.extId, msg.message);
+      return { ok: true, data: response ?? null };
+    } catch (e) {
+      return {
+        ok: false,
+        code: 'extension_message_failed',
+        error: e.message,
+        hint: 'The target extension must be enabled and allow this ABM extension in externally_connectable.',
+      };
+    }
+  }
   if (msg.cmd === 'management') {
     try {
       if (msg.method === 'list') {
         const all = await chrome.management.getAll();
         return { ok: true, data: all.map(e => ({ id: e.id, name: e.name, enabled: e.enabled, type: e.type, version: e.version })) };
-      }
-      if (msg.method === 'reload') {
-        chrome.alarms.create('tmwd-self-reload', { when: Date.now() + 200 });
-        return { ok: true };
       }
       if (msg.method === 'disable') {
         await chrome.management.setEnabled(msg.extId, false);
@@ -101,6 +1835,13 @@ async function handleExtMessage(msg, sender) {
         return { ok: true };
       }
       if (msg.method === 'uninstall') {
+        if (msg.extId === chrome.runtime.id) {
+          return {
+            ok: false,
+            code: 'self_uninstall_unsupported',
+            error: 'The ABM bridge cannot uninstall itself through its active response channel.',
+          };
+        }
         await chrome.management.uninstall(msg.extId, { showConfirmDialog: msg.showConfirmDialog !== false });
         return { ok: true };
       }
@@ -291,17 +2032,44 @@ async function handleExtMessage(msg, sender) {
       return { ok: false, error: 'Unknown method: ' + msg.method };
     } catch (e) { return { ok: false, error: e.message }; }
   }
-  return { ok: false, error: 'Unknown cmd: ' + msg.cmd };
+  if (msg.cmd === 'network_capture') return await handleNetworkCaptureCommand(msg, sender);
+  if (msg.cmd === 'console') return await handleConsoleCaptureCommand(msg, sender);
+  const knownCommands = [
+    'site_permission', 'dialog_state', 'handle_dialog', 'navigate',
+    'set_dialog_policy', 'clear_dialog_policy', 'cookies', 'cdp', 'batch',
+    'tabs', 'debugger_targets', 'management', 'bookmarks', 'call_extension',
+    'network_capture', 'console', 'bridge_status',
+  ];
+  if (msg.cmd === 'bridge_status') {
+    return { ok: true, data: { version: '2026.08.11-lab', knownCommands } };
+  }
+  return {
+    ok: false,
+    code: 'unknown_cmd',
+    error: `Unknown extension cmd: ${msg.cmd}`,
+    version: '2026.08.11-lab',
+    knownCommands,
+    hint: 'The extension command router is alive; compare knownCommands and reload the unpacked extension if this server expects a newer build.',
+  };
 }
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  // tmwd_ping has its own dedicated listener below that answers synchronously;
+  // letting it fall through to handleExtMessage would race two sendResponse
+  // calls on the same message and log a noisy "Unknown cmd". Skip it here.
+  if (msg && msg.cmd === 'tmwd_ping') return false;
   handleExtMessage(msg, sender).then(sendResponse);
   return true;
 });
 
 async function handleCookies(msg, sender) {
   try {
-    let url = msg.url || sender.tab?.url;
+    // A page-driven request (via the TID channel) must not name an arbitrary
+    // site: the page only gets to read cookies for its own origin, not
+    // whatever URL it stuffed into msg.url. WS-bridge calls have no sender.tab
+    // and may name any tab. This is what stops a compromised page from reading
+    // the user's mail/bank cookies through this extension.
+    let url = (sender && sender.tab) ? sender.tab.url : (msg.url || null);
     if (!url && msg.tabId) {
       const tab = await chrome.tabs.get(msg.tabId);
       url = tab.url;
@@ -321,7 +2089,8 @@ async function handleCookies(msg, sender) {
 
 async function handleBatch(msg, sender) {
   const R = [];
-  let attached = null;
+  let attachedTabId = null;
+  let debuggerLease = null;
   const resolve$N = (params) => JSON.parse(JSON.stringify(params || {}).replace(/"\$(\d+)\.([^"]+)"/g,
     (_, i, path) => { let v = R[+i]; for (const k of path.split('.')) v = v[k]; return JSON.stringify(v); }));
   try {
@@ -334,21 +2103,36 @@ async function handleBatch(msg, sender) {
         R.push({ ok: true, data: tabs.map(t => ({ id: t.id, url: t.url, title: t.title, active: t.active, windowId: t.windowId })) });
       } else if (c.cmd === 'cdp') {
         const tabId = c.tabId || msg.tabId || sender.tab?.id;
-        if (attached !== tabId) {
-          if (attached) { await chrome.debugger.detach({ tabId: attached }); attached = null; }
-          await chrome.debugger.attach({ tabId }, '1.3');
-          attached = tabId;
+        if (attachedTabId !== tabId) {
+          if (debuggerLease) {
+            const previousLease = debuggerLease;
+            debuggerLease = null;
+            attachedTabId = null;
+            await detachAbmDebugger(previousLease);
+          }
+          debuggerLease = await attachAbmDebugger({ tabId });
+          attachedTabId = tabId;
         }
-        R.push(await chrome.debugger.sendCommand({ tabId }, c.method, resolve$N(c.params)));
+        R.push(await sendDebuggerCommandWithTimeout(
+          debuggerLease, c.method, resolve$N(c.params),
+          boundedCdpTimeout(c.timeoutMs ?? msg.timeoutMs),
+        ));
       } else {
         R.push({ ok: false, error: 'unknown cmd: ' + c.cmd });
       }
     }
-    if (attached) await chrome.debugger.detach({ tabId: attached });
     return { ok: true, results: R };
   } catch (e) {
-    if (attached) try { await chrome.debugger.detach({ tabId: attached }); } catch (_) {}
-    return { ok: false, error: e.message, results: R };
+    const code = debuggerFailureCode(e);
+    return {
+      ok: false, code, error: e.message || String(e), results: R,
+      retryable: code === 'cdp_timeout' || code === 'debugger_detached',
+      hint: code === 'debugger_conflict'
+        ? 'Close DevTools or the competing debugger on this tab, then retry.'
+        : 'ABM invalidated and detached the timed-out debugger lease; retry once on the same tab.',
+    };
+  } finally {
+    if (debuggerLease) try { await detachAbmDebugger(debuggerLease); } catch (_) {}
   }
 }
 
@@ -367,21 +2151,43 @@ async function handleCDP(msg, sender) {
   if (!target.targetId && !target.extensionId && !target.tabId) {
     return { ok: false, error: 'no tabId, extensionId or targetId' };
   }
+  let debuggerLease = null;
   try {
-    await chrome.debugger.attach(target, '1.3');
-    const result = await chrome.debugger.sendCommand(target, msg.method, msg.params || {});
-    await chrome.debugger.detach(target);
+    debuggerLease = await attachAbmDebugger(target);
+    const result = await sendDebuggerCommandWithTimeout(
+      debuggerLease, msg.method, msg.params || {}, boundedCdpTimeout(msg.timeoutMs),
+    );
     return { ok: true, data: result };
   } catch (e) {
-    try { await chrome.debugger.detach(target); } catch (_) {}
-    return { ok: false, error: e.message };
+    const code = debuggerFailureCode(e);
+    return {
+      ok: false,
+      code,
+      error: e.message || String(e),
+      method: msg.method,
+      timeout_ms: boundedCdpTimeout(msg.timeoutMs),
+      retryable: code === 'cdp_timeout' || code === 'debugger_detached',
+      hint: code === 'debugger_conflict'
+        ? 'Close DevTools or the competing debugger on this tab, then retry.'
+        : 'ABM invalidated and detached the timed-out debugger lease; retry once after list_tabs.',
+    };
+  } finally {
+    if (debuggerLease) try { await detachAbmDebugger(debuggerLease); } catch (_) {}
   }
 }
 // Filter out chrome:// and other internal tabs that can't be scripted
 const isScriptable = url => url && /^https?:/.test(url);
 
 // --- Shared page/CDP script builder core ---
-function buildExecScript(code, errorHandler) {
+function buildExecScript(code, errorHandler, dialogScope = null, sourceUrl = null) {
+  const hasDialogScope = Boolean(
+    dialogScope?.token &&
+    (dialogScope.policy === 'dismiss' || dialogScope.policy === 'accept')
+  );
+  const dialogToken = hasDialogScope ? dialogScope.token : null;
+  const dialogPolicy = hasDialogScope ? dialogScope.policy : null;
+  const execSourceUrl = typeof sourceUrl === 'string' && sourceUrl
+    ? sourceUrl.replace(/[\r\n]/g, '') : null;
   return `(async () => {
     function smartProcessResult(result) {
       if (result === null || result === undefined || typeof result !== 'object') return result;
@@ -402,9 +2208,48 @@ function buildExecScript(code, errorHandler) {
       }
       try { return JSON.parse(JSON.stringify(result, function(key, value) { if (typeof value === 'object' && value !== null) { if (value.nodeType === 1) return value.outerHTML; if (value === window || value === document) return '[Object]'; try { if (value.window === value && value.document) return '[Window]'; } catch(_){} } return value; })); } catch (e) { return '[无法序列化: ' + e.message + ']'; }
     }
+    // Dialog suppression is scoped to this command: disable_dialogs.js defers
+    // to the native alert/confirm/prompt unless this deadline is in the future,
+    // so the user's own confirmations keep working during normal browsing.
+    //
+    // A DEADLINE rather than a boolean, because a boolean stays stuck on if the
+    // script throws past the finally, the tab navigates mid-command, or the
+    // worker is evicted — and a stuck flag silently eats the user's own
+    // confirm() dialogs, which is the very bug this was meant to fix.
+    //
+    // Each command captures its OWN deadline. Two concurrent commands used to
+    // share one window.__tmwd_suppress_until slot: whichever finished first
+    // zeroed it, un-suppressing the dialog while the other command's script
+    // was still mid-flight. Only the command that set the CURRENT value may
+    // clear it.
+    const _tmwdHasDialogScope = ${JSON.stringify(hasDialogScope)};
+    const _tmwdDeadline = _tmwdHasDialogScope ? Date.now() + 120000 : 0;
+    const _tmwdDialogToken = ${JSON.stringify(dialogToken)};
+    if (_tmwdHasDialogScope) {
+      const _tmwdDialogScope = {
+        token: _tmwdDialogToken,
+        policy: ${JSON.stringify(dialogPolicy)},
+        deadline: _tmwdDeadline,
+      };
+      const _tmwdScopes = Array.isArray(window.__tmwd_dialog_scopes)
+        ? window.__tmwd_dialog_scopes : [];
+      _tmwdScopes.push(_tmwdDialogScope);
+      window.__tmwd_dialog_scopes = _tmwdScopes;
+      window.__tmwd_suppress_until = Math.max(
+        _tmwdDeadline,
+        ..._tmwdScopes.map(scope => Number(scope.deadline) || 0),
+      );
+    }
+    const _tmwdRecords = () => (Array.isArray(window.__tmwd_dialog_records)
+      ? window.__tmwd_dialog_records : [])
+      .filter(record => record.token === _tmwdDialogToken);
     try {
-      const jsCode = ${JSON.stringify(code)}.trim();
-      const lines = jsCode.split(/\\r?\\n/).filter(l => l.trim());
+      const rawJsCode = ${JSON.stringify(code)}.trim();
+      const _tmwdExecSourceUrl = ${JSON.stringify(execSourceUrl)};
+      const _tmwdWithSourceUrl = c => _tmwdExecSourceUrl
+        ? c + '\\n//# sourceURL=' + _tmwdExecSourceUrl : c;
+      const jsCode = _tmwdWithSourceUrl(rawJsCode);
+      const lines = rawJsCode.split(/\\r?\\n/).filter(l => l.trim());
       const lastLine = lines.length > 0 ? lines[lines.length - 1].trim() : '';
       const AsyncFunction = Object.getPrototypeOf(async function(){}).constructor;
       let r;
@@ -413,28 +2258,363 @@ function buildExecScript(code, errorHandler) {
         r = await (new AsyncFunction(jsCode))();
       } else {
         try { r = eval(jsCode); if (r instanceof Promise) r = await r; } catch (e) {
-          if (e instanceof SyntaxError && (/return/i.test(e.message) || /await/i.test(e.message))) { r = await (new AsyncFunction(_air(jsCode)))(); } else throw e;
+          if (e instanceof SyntaxError && /return/i.test(e.message)) {
+            // A single-line script can contain several statements followed by
+            // an explicit return. Auto-returning that whole line would return
+            // after its first expression and silently skip the later work.
+            r = await (new AsyncFunction(jsCode))();
+          } else if (e instanceof SyntaxError && /await/i.test(e.message)) {
+            r = await (new AsyncFunction(_tmwdWithSourceUrl(_air(rawJsCode))))();
+          } else throw e;
         }
       }
-      return { ok: true, data: smartProcessResult(r) };
+      const processed = smartProcessResult(r);
+      if (_tmwdHasDialogScope) {
+        return { ok: true, data: {
+          __tmwd_dialog_result: true,
+          value: processed,
+          dialogs: _tmwdRecords(),
+        } };
+      }
+      return { ok: true, data: processed };
     } catch (e) {
       ${errorHandler}
+    } finally {
+      if (_tmwdHasDialogScope && Array.isArray(window.__tmwd_dialog_scopes)) {
+        window.__tmwd_dialog_scopes = window.__tmwd_dialog_scopes
+          .filter(scope => scope.token !== _tmwdDialogToken && Date.now() < scope.deadline);
+        window.__tmwd_suppress_until = window.__tmwd_dialog_scopes.reduce(
+          (latest, scope) => Math.max(latest, Number(scope.deadline) || 0), 0
+        );
+      } else if (_tmwdHasDialogScope && window.__tmwd_suppress_until === _tmwdDeadline) {
+        window.__tmwd_suppress_until = 0;
+      }
     }
   })()`;
 }
 
-function buildPageScript(code) {
+function buildPageScript(code, dialogScope = null) {
   return buildExecScript(code, `
       const errMsg = e.message || String(e);
       return { ok: false, error: { name: e.name || 'Error', message: errMsg, stack: e.stack || '' },
         csp: errMsg.includes('Refused to evaluate') || errMsg.includes('unsafe-eval') || errMsg.includes('Content Security Policy') };
-  `);
+  `, dialogScope);
 }
 
-function buildCdpScript(code) {
+function buildCdpScript(code, dialogScope = null, sourceUrl = null) {
   return buildExecScript(code, `
       return { ok: false, error: { name: e.name || 'Error', message: e.message || String(e), stack: e.stack || '' } };
-  `);
+  `, dialogScope, sourceUrl);
+}
+
+function manualExecutionResult(status, dialog = null) {
+  const blocked = status === 'blocked_by_dialog';
+  return { ok: true, data: {
+    __tmwd_dialog_result: true,
+    value: null,
+    dialogs: dialog ? [dialog] : [],
+    dialog,
+    status,
+    dialog_action: 'manual',
+    dialog_observed: Boolean(dialog),
+    handled: false,
+    pending_execution: true,
+    manual_blocked: blocked,
+  } };
+}
+
+function manualRawSyntaxError(error) {
+  const message = error?.message || String(error);
+  return { ok: true, data: {
+    __tmwd_dialog_result: true,
+    value: null,
+    dialogs: [],
+    dialog: null,
+    status: 'manual_raw_syntax_error',
+    dialog_action: 'manual',
+    dialog_observed: false,
+    handled: false,
+    pending_execution: false,
+    manual_blocked: false,
+    error: {
+      code: 'manual_raw_syntax_error',
+      name: 'SyntaxError',
+      message,
+      suggestion: 'Use a raw expression (remove `return expr`) or write an authored IIFE explicitly.',
+    },
+  } };
+}
+
+function manualExecutionError(error, prefix = 'manual CDP execution failed: ') {
+  const message = error?.message || String(error);
+  return { ok: false, error: {
+    name: error?.name || 'Error',
+    message: prefix + message,
+    stack: error?.stack || '',
+  } };
+}
+
+function normalizeManualEvaluation(evaluationOutcome) {
+  if (evaluationOutcome.kind === 'evaluation_error') {
+    return manualExecutionError(evaluationOutcome.error, '');
+  }
+  const evaluation = evaluationOutcome.evaluation;
+  if (evaluation?.exceptionDetails) {
+    const exception = evaluation.exceptionDetails.exception;
+    if (exception?.className === 'SyntaxError' ||
+        /SyntaxError/i.test(evaluation.exceptionDetails.text || '') ||
+        /SyntaxError/i.test(exception?.description || '')) {
+      return manualRawSyntaxError({
+        message: exception?.description || evaluation.exceptionDetails.text || 'SyntaxError',
+      });
+    }
+    const description = evaluation.exceptionDetails.exception?.description ||
+      evaluation.exceptionDetails.text || 'CDP Error';
+    return { ok: false, error: {
+      name: 'Error', message: description, stack: description,
+    } };
+  }
+  const value = evaluation?.result?.value;
+  return { ok: true, data: value };
+}
+
+async function releaseManualExecution(pending) {
+  if (!pending) return;
+  if (pending.releasePromise) return await pending.releasePromise;
+  pending.released = true;
+  pending.state = 'released';
+  if (pending.expiryTimer) {
+    clearTimeout(pending.expiryTimer);
+    pending.expiryTimer = null;
+  }
+  if (pendingManualExecutions.get(pending.tabId) === pending) {
+    pendingManualExecutions.delete(pending.tabId);
+  }
+  const debuggerLease = pending.debuggerLease;
+  pending.debuggerLease = null;
+  pending.releasePromise = (async () => {
+    if (debuggerLease) {
+      try { await detachAbmDebugger(debuggerLease); } catch (_) {}
+    }
+  })();
+  await pending.releasePromise;
+}
+
+async function cancelManualExecution(tabId, reason, expectedPending = null) {
+  const pending = pendingManualExecutions.get(tabId);
+  if (!pending || (expectedPending && pending !== expectedPending)) return false;
+  pending.cancelReason = reason;
+  pending.state = 'cancelled';
+  if (!pending.cancelResolved) {
+    pending.cancelResolved = true;
+    pending.resolveCancel({ kind: 'cancelled', reason });
+  }
+  await releaseManualExecution(pending);
+  return true;
+}
+
+async function executeManualScript(tabId, code, dialogScope) {
+  const existing = pendingManualExecutions.get(tabId);
+  if (existing) return manualExecutionResult('busy', existing.dialog || null);
+
+  const target = { tabId };
+  const pending = {
+    tabId,
+    token: dialogScope.token,
+    generation: nextManualExecutionGeneration++,
+    debuggerLease: null,
+    mainFrameId: null,
+    executionContextId: null,
+    evaluationStarted: false,
+    evaluationSettled: false,
+    state: 'preparing',
+    eventFloor: Number.POSITIVE_INFINITY,
+    deadline: 0,
+    expiryTimer: null,
+    dialog: null,
+    released: false,
+    releasePromise: null,
+    cancelResolved: false,
+    resolveDialog: null,
+    resolveCancel: null,
+  };
+  pending.dialogSignal = new Promise(resolve => { pending.resolveDialog = resolve; });
+  pending.cancelSignal = new Promise(resolve => { pending.resolveCancel = resolve; });
+  pendingManualExecutions.set(tabId, pending);
+  manualExecutionGenerations.set(tabId, pending.generation);
+
+  try {
+    pending.debuggerLease = await attachAbmDebugger(target);
+    await sendDebuggerCommandWithTimeout(pending.debuggerLease, 'Page.enable', {}, 5000);
+    await sendDebuggerCommandWithTimeout(pending.debuggerLease, 'Runtime.enable', {}, 5000);
+    const frameTree = await sendDebuggerCommandWithTimeout(
+      pending.debuggerLease, 'Page.getFrameTree', {}, 5000,
+    );
+    pending.mainFrameId = frameTree?.frameTree?.frame?.id || null;
+    if (!pending.mainFrameId) {
+      throw new Error('manual execution could not resolve the main frame');
+    }
+    pending.executionContextId = await waitForDefaultRuntimeExecutionContext(
+      tabId, pending.mainFrameId,
+    );
+
+    await sendDebuggerCommandWithTimeout(pending.debuggerLease, 'Runtime.evaluate', {
+      expression: 'void 0',
+      contextId: pending.executionContextId,
+      returnByValue: true,
+    }, 5000);
+    if (pendingManualExecutions.get(tabId) !== pending || pending.released) {
+      throw new Error('manual execution ownership changed before evaluation');
+    }
+    pending.eventFloor = (dialogEventSequences.get(tabId) || 0) + 1;
+    pending.deadline = Date.now() + Math.max(1, Number(dialogScope.timeoutMs) || 15000);
+    pending.state = 'armed';
+    pending.evaluationStarted = true;
+    pending.expiryTimer = setTimeout(() => {
+      if (pendingManualExecutions.get(tabId) === pending &&
+          pending.state === 'armed' && !pending.dialog) {
+        void cancelManualExecution(
+          tabId, 'manual dialog ownership expired while waiting for an outcome', pending,
+        );
+      }
+    }, Math.max(1, Number(dialogScope.timeoutMs) || 15000));
+    let evaluationCommand;
+    try {
+      evaluationCommand = sendDebuggerCommandWithTimeout(
+        pending.debuggerLease, 'Runtime.evaluate', {
+        expression: code,
+        contextId: pending.executionContextId,
+        awaitPromise: true,
+        returnByValue: true,
+        replMode: true,
+      }, boundedCdpTimeout(dialogScope.timeoutMs, 15000));
+    } catch (error) {
+      evaluationCommand = Promise.reject(error);
+    }
+    pending.evaluationPromise = Promise.resolve(evaluationCommand).then(
+      evaluation => {
+        pending.evaluationSettled = true;
+        pending.state = 'settled';
+        return { kind: 'evaluation', evaluation };
+      },
+      error => {
+        pending.evaluationSettled = true;
+        pending.state = 'settled';
+        return { kind: 'evaluation_error', error };
+      },
+    );
+    pending.settlementPromise = (async () => {
+      const outcome = await pending.evaluationPromise;
+      await releaseManualExecution(pending);
+      return normalizeManualEvaluation(outcome);
+    })();
+
+    const first = await Promise.race([
+      pending.settlementPromise.then(result => ({ kind: 'evaluation', result })),
+      pending.dialogSignal,
+      pending.cancelSignal,
+    ]);
+    if (first.kind === 'dialog') {
+      return manualExecutionResult('blocked_by_dialog', first.dialog);
+    }
+    if (first.kind === 'cancelled') {
+      await releaseManualExecution(pending);
+      return manualExecutionError(
+        new Error(first.reason || 'manual execution cancelled'), ''
+      );
+    }
+    return first.result;
+  } catch (error) {
+    await cancelManualExecution(tabId, error.message || String(error));
+    return manualExecutionError(error);
+  }
+}
+
+// --- Scoped, temporary CSP removal -----------------------------------------
+// Stripping CSP is necessary for eval-based injection, but it must not leak
+// beyond the tab being automated or outlive the command. Session rules are
+// never persisted to disk, so even a crash can't leave the profile exposed
+// past a browser restart. Rule ids are namespaced per tab to allow parallel
+// commands on different tabs; a refcount keeps nested calls on the SAME tab
+// from tearing the rule down early.
+const CSP_RULE_BASE = 90000;
+// tabId -> {depth, ruleId}. A single tab can have nested withCspOff calls
+// (e.g. a retry inside the original); the depth refcount keeps the rule alive
+// until the LAST nested call exits. ruleId is allocated once per tab so two
+// different tabs never share an id (tabId % 9000 collided once tabId >= 9000).
+const cspRefs = new Map();
+let cspNextRuleId = CSP_RULE_BASE;
+function cspRuleIdFor(tabId) {
+  let entry = cspRefs.get(tabId);
+  if (!entry) {
+    entry = { depth: 0, ruleId: cspNextRuleId++ };
+    cspRefs.set(tabId, entry);
+  }
+  return entry;
+}
+
+// A crash or eviction mid-command could leave a rule behind, and a leftover
+// rule means CSP stays off for that tab. Session rules die with the browser,
+// but the worker restarts far more often than the browser does — so sweep a
+// generous id range on every startup. cspNextRuleId resets on SW restart, so
+// the sweep range must not depend on the in-memory counter.
+(async () => {
+  try {
+    const rules = await chrome.declarativeNetRequest.getSessionRules();
+    // Sweep every rule in our namespace. tabId is unbounded and ruleId grows
+    // with it, so a fixed cap would miss rules from large tabIds.
+    const ours = rules.filter(r => r.id >= CSP_RULE_BASE).map(r => r.id);
+    if (ours.length) {
+      await chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds: ours });
+      console.log('[TMWD] cleared', ours.length, 'stale CSP rule(s)');
+    }
+  } catch (_) { /* API unavailable: nothing to clean */ }
+})();
+
+async function withCspOff(tabId, fn) {
+  const entry = cspRuleIdFor(tabId);
+  const ruleId = entry.ruleId;
+  // Increment the refcount BEFORE the await. Doing it after let two concurrent
+  // calls both read depth=0, both add the rule, and both tear it down in their
+  // finally — even while the other call's fn() was still relying on it.
+  entry.depth += 1;
+  if (entry.depth === 1) {
+    try {
+      await chrome.declarativeNetRequest.updateSessionRules({
+        removeRuleIds: [ruleId],
+        addRules: [{
+          id: ruleId, priority: 1,
+          action: { type: 'modifyHeaders', responseHeaders: [
+            { header: 'content-security-policy', operation: 'remove' },
+            { header: 'content-security-policy-report-only', operation: 'remove' }
+          ]},
+          // tabIds confines this to the automated tab only.
+          condition: { urlFilter: '*', resourceTypes: ['main_frame', 'sub_frame'], tabIds: [tabId] }
+        }]
+      });
+    } catch (e) {
+      // Not fatal: injection may still succeed on pages without CSP, and the
+      // CDP fallback bypasses CSP entirely.
+      console.log('[TMWD] CSP rule add failed:', e.message);
+    }
+  }
+  try {
+    // Never let a hung injection keep CSP off: race the work against a cap so
+    // `finally` always runs and the rule always comes back.
+    return await Promise.race([
+      fn(),
+      new Promise((_, rej) => setTimeout(
+        () => rej(new Error('CSP-relaxed injection timed out')), 30000)),
+    ]);
+  } finally {
+    entry.depth -= 1;
+    if (entry.depth <= 0) {
+      cspRefs.delete(tabId);
+      try {
+        await chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds: [ruleId] });
+      } catch (_) { /* rule may already be gone with the tab */ }
+    }
+  }
 }
 
 // --- WebSocket Client for TMWebDriver ---
@@ -482,9 +2662,67 @@ function scheduleProbe() {
   chrome.alarms.create('tmwd-ws-probe', { delayInMinutes: 0.5, periodInMinutes: 1 });
 }
 
+// Keep the SW alive while the WS is connected.
+//
+// This used to rely on chrome.alarms.create({delayInMinutes: 0.4}) with the
+// comment "~24s, under the 30s SW timeout". Chrome's minimum alarm delay is
+// 30s, so 0.4 was clamped UP to at least the timeout it was supposed to beat —
+// the alarm could only re-wake the worker after an eviction, never prevent it.
+// It also left the no-tab case unprotected: with zero scriptable tabs there is
+// no content.js tick, which is exactly the state the "works with no tabs open"
+// tools exist to serve.
+//
+// Activity on an extension API / message port DOES reset the idle timer, so a
+// self-driven ping over the socket is what actually holds the worker up. 20s
+// stays clear of the 30s limit, and the ping doubles as the liveness probe the
+// pong watchdog already consumes.
+let keepaliveTimer = null;
+const KEEPALIVE_MS = 20000;
+
 function scheduleKeepalive() {
-  // Keep SW alive while WS is connected (~25s, under 30s SW timeout)
-  chrome.alarms.create('tmwd-ws-keepalive', { delayInMinutes: 0.4 }); // ~24s
+  if (keepaliveTimer !== null) return; // already ticking
+  keepaliveTimer = setInterval(() => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      stopKeepalive();
+      ws = null;
+      ensureConnected('keepalive-lost');
+      scheduleProbe(); // alarm keeps retrying even if this worker is evicted
+      return;
+    }
+    // Zombie check: on a half-open socket send() succeeds silently and the OS
+    // won't surface the dead peer for minutes, so we'd keep pushing tabs into a
+    // black hole. No pong across ~3 ticks => treat the socket as dead.
+    if (lastPongAt && Date.now() - lastPongAt > 55000) {
+      console.log('[TMWD-WS] pong timeout, forcing reconnect');
+      try { ws.close(); } catch (_) {}
+      ws = null;
+      lastPongAt = 0;
+      stopKeepalive();
+      ensureConnected('keepalive-pong-timeout');
+      scheduleProbe();
+      return;
+    }
+    try {
+      ws.send(JSON.stringify({ type: 'ping' }));
+      // After a bridge restart the socket can stay OPEN client-side while the
+      // new daemon has an empty session table — re-push tabs every tick so MCP
+      // recovers without user action.
+      sendTabsUpdate();
+      // Touching an extension API resets the idle timer even if the socket
+      // write alone were not enough.
+      chrome.runtime.getPlatformInfo(() => { void chrome.runtime.lastError; });
+    } catch (e) {
+      console.log('[TMWD-WS] keepalive ping failed:', e.message);
+      ws = null;
+      stopKeepalive();
+      ensureConnected('keepalive-send-failed');
+      scheduleProbe();
+    }
+  }, KEEPALIVE_MS);
+}
+
+function stopKeepalive() {
+  if (keepaliveTimer !== null) { clearInterval(keepaliveTimer); keepaliveTimer = null; }
 }
 
 async function isServerAlive() {
@@ -519,45 +2757,19 @@ function ensureConnected(reason) {
 }
 
 chrome.alarms.onAlarm.addListener(async (alarm) => {
-  if (alarm.name === 'tmwd-self-reload') {
-    chrome.runtime.reload();
-    return;
-  }
   if (alarm.name === 'tmwd-ws-keepalive') {
-    // Keepalive: ping to keep SW alive + detect dead / half-open connections.
-    // After bridge restart the socket can stay OPEN client-side while the new
-    // daemon has an empty session table — re-push tabs every tick so MCP recovers.
+    // Legacy alarm from older installs. The ping/zombie/re-register logic now
+    // lives in the setInterval keepalive (alarms can't fire faster than 60s,
+    // so they could never hold the worker up). Keep this as a recovery path:
+    // if the worker was evicted anyway, this re-arms everything.
     if (ws && ws.readyState === WebSocket.OPEN) {
-      // Zombie check: on a half-open socket send() succeeds silently and the
-      // OS won't surface the dead peer for minutes, so we'd keep pushing tabs
-      // into a black hole. If the bridge hasn't pong'd across two full ticks
-      // (~48s), treat the socket as dead and force a fresh connect.
-      if (lastPongAt && Date.now() - lastPongAt > 55000) {
-        console.log('[TMWD-WS] pong timeout, forcing reconnect');
-        try { ws.close(); } catch (_) {}
-        ws = null;
-        lastPongAt = 0;
-        ensureConnected('keepalive-pong-timeout');
-        scheduleProbe();
-        return;
-      }
-      try {
-        ws.send('{"type":"ping"}');
-        // fire-and-forget re-register; must not block the alarm handler
-        sendTabsUpdate();
-      } catch (_) {
-        ws = null;
-        ensureConnected('keepalive-send-failed');
-        scheduleProbe();
-        return;
-      }
       scheduleKeepalive();
     } else {
-      // Connection lost, switch to probe mode
       ws = null;
       ensureConnected('keepalive-lost');
       scheduleProbe();
     }
+    chrome.alarms.clear('tmwd-ws-keepalive');
   }
   if (alarm.name === 'tmwd-ws-probe') {
     if (ws && ws.readyState <= 1) return; // Already connected/connecting
@@ -570,59 +2782,103 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
 
 async function handleWsExec(data) {
   const tabId = data.tabId;
+  const dialogScopeMatch = typeof data.code === 'string'
+    ? data.code.match(/\/\*__tmwd_dialog_scope:([A-Za-z0-9._-]+)\*\//)
+    : null;
+  const dialogScopeToken = dialogScopeMatch ? dialogScopeMatch[1] : null;
+  const dialogScope = currentExecDialogPolicy(tabId, dialogScopeToken) ||
+    (!dialogScopeToken ? claimManualExecDialogPolicy(tabId, data.code) : null);
   console.log('[TMWD-WS] Exec request', data.id, 'on tab', tabId);
   // Same dead-socket hazard as onmessage, with a wider window: script exec plus
   // the CDP fallback can run for seconds while the bridge restarts under us.
   const sock = ws;
   const send = (obj) => {
-    if (sock && sock.readyState === WebSocket.OPEN) sock.send(JSON.stringify(obj));
+    if (sock && sock.readyState === WebSocket.OPEN) {
+      try { sock.send(JSON.stringify(obj)); return true; } catch (_) { return false; }
+    }
+    return false;
   };
-  send({ type: 'ack', id: data.id });
+  // The ACK is the bridge's ONLY signal that the script was delivered: no ACK
+  // means it classifies the command "undelivered" and retries it as
+  // side-effect-free. So if the ACK can't go out, we must NOT run the script —
+  // otherwise a form submit / purchase executes here, the retry runs it again,
+  // and the agent sees a clean success on a double execution.
+  if (!send({ type: 'ack', id: data.id })) {
+    console.log('[TMWD-WS] ACK undeliverable, skipping exec so the retry stays safe', data.id);
+    return;
+  }
   if (!tabId) {
     send({ type: 'error', id: data.id, error: 'No tabId provided' });
     return;
   }
-  // Use onCreated listener to reliably capture new tabs (avoids race condition with query-diff)
+  // Use onCreated listener to reliably capture new tabs (avoids race condition with query-diff).
+  // Only count tabs THIS script opened (openerTabId === tabId): without the
+  // filter every new tab in the browser — including ones the user opens by
+  // hand or other extensions create — gets reported as a script side-effect.
   const newTabIds = new Set();
-  const onCreated = (tab) => { newTabIds.add(tab.id); };
+  const onCreated = (tab) => { if (tab.openerTabId === tabId) newTabIds.add(tab.id); };
   chrome.tabs.onCreated.addListener(onCreated);
   try {
     let res;
-    try {
-      const result = await chrome.scripting.executeScript({
-        target: { tabId },
-        world: 'MAIN',
-        func: async (s) => await eval(s),
-        args: [buildPageScript(data.code)]
-      });
-      res = result[0]?.result;
-      if (res === null || res === undefined) {
-        console.log('[TMWD-WS] executeScript returned null/undefined, treating as CSP issue');
-        res = { ok: false, error: { name: 'Error', message: 'executeScript returned null (possible CSP or context issue)', stack: '' }, csp: true };
-      }
-    } catch (e) {
-      console.log('[TMWD-WS] scripting.executeScript failed:', e.message);
-      res = { ok: false, error: { name: e.name || 'Error', message: e.message || String(e), stack: e.stack || '' }, csp: true };
-    }
-    // CDP fallback for CSP-restricted pages
-    if (res && !res.ok && res.csp) {
-      console.log('[TMWD-WS] CDP fallback for tab', tabId);
-      const wrappedCode = buildCdpScript(data.code);
-      try {
-        await chrome.debugger.attach({ tabId }, '1.3');
-        const cdpRes = await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', {
-          expression: wrappedCode, awaitPromise: true, returnByValue: true
+    if (dialogScope?.policy === 'manual') {
+      // Manual must be stopped by the debugger outside user-controlled
+      // JavaScript. A thrown sentinel can always be caught by indirect eval or
+      // a Function constructor, so manual evaluations never use executeScript.
+      res = await executeManualScript(tabId, data.code, dialogScope);
+    } else {
+      const inject = async () => {
+        const result = await chrome.scripting.executeScript({
+          target: { tabId },
+          world: 'MAIN',
+          func: async (s) => await eval(s),
+          args: [buildPageScript(data.code, dialogScope)]
         });
-        await chrome.debugger.detach({ tabId });
-        if (cdpRes.exceptionDetails) {
-          const desc = cdpRes.exceptionDetails.exception?.description || 'CDP Error';
-          res = { ok: false, error: { name: 'Error', message: desc, stack: desc } };
-        } else {
-          res = cdpRes.result.value;
+        let r = result[0]?.result;
+        if (r === null || r === undefined) {
+          console.log('[TMWD-WS] executeScript returned null/undefined, treating as CSP issue');
+          r = { ok: false, error: { name: 'Error', message: 'executeScript returned null (possible CSP or context issue)', stack: '' }, csp: true };
         }
-      } catch (cdpErr) {
-        try { await chrome.debugger.detach({ tabId }); } catch (_) {}
-        res = { ok: false, error: { name: 'Error', message: 'CDP fallback failed: ' + cdpErr.message, stack: '' } };
+        return r;
+      };
+      try {
+        // First attempt WITHOUT touching CSP. Most pages inject fine, and a
+        // declarativeNetRequest rule change makes Chrome re-evaluate the tab's
+        // requests — doing that in the same await chain as the injection made
+        // executeScript hang indefinitely (ACK sent, result never returned).
+        res = await inject();
+        // Only a CSP-flavoured failure justifies relaxing the header, and then
+        // only for this tab, for this one retry.
+        if (res && !res.ok && res.csp) {
+          console.log('[TMWD-WS] retrying injection with CSP relaxed for tab', tabId);
+          try { res = await withCspOff(tabId, inject); } catch (e) {
+            console.log('[TMWD-WS] CSP-relaxed retry failed:', e.message);
+          }
+        }
+      } catch (e) {
+        console.log('[TMWD-WS] scripting.executeScript failed:', e.message);
+        res = { ok: false, error: { name: e.name || 'Error', message: e.message || String(e), stack: e.stack || '' }, csp: true };
+      }
+      // CDP fallback for CSP-restricted pages
+      if (res && !res.ok && res.csp) {
+        console.log('[TMWD-WS] CDP fallback for tab', tabId);
+        const wrappedCode = buildCdpScript(data.code, dialogScope);
+        let cdpLease = null;
+        try {
+          cdpLease = await attachAbmDebugger({ tabId });
+          const cdpRes = await sendDebuggerCommandWithTimeout(cdpLease, 'Runtime.evaluate', {
+            expression: wrappedCode, awaitPromise: true, returnByValue: true
+          }, DEFAULT_CDP_TIMEOUT_MS);
+          if (cdpRes.exceptionDetails) {
+            const desc = cdpRes.exceptionDetails.exception?.description || 'CDP Error';
+            res = { ok: false, error: { name: 'Error', message: desc, stack: desc } };
+          } else {
+            res = cdpRes.result.value;
+          }
+        } catch (cdpErr) {
+          res = { ok: false, error: { name: 'Error', message: 'CDP fallback failed: ' + cdpErr.message, stack: '' } };
+        } finally {
+          if (cdpLease) try { await detachAbmDebugger(cdpLease); } catch (_) {}
+        }
       }
     }
     // Grace period for async tab creation (e.g. link click with target=_blank)
@@ -631,16 +2887,27 @@ async function handleWsExec(data) {
     // Get full info for captured new tabs
     const newTabs = [];
     for (const id of newTabIds) {
-      try { const t = await chrome.tabs.get(id); newTabs.push({id: t.id, url: t.url, title: t.title}); } catch (_) {}
+      try {
+        const t = await chrome.tabs.get(id);
+        newTabs.push({
+          id: t.id,
+          url: t.url,
+          title: t.title,
+          generation: await tabGenerationFor(t.id),
+        });
+      } catch (_) {}
     }
     if (res?.ok) {
-      send({ type: 'result', id: data.id, result: res.data, newTabs });
+      // Echo back the tab we actually ran on. The Python side reports this
+      // instead of guessing from its remembered default, which can be stale
+      // (or None) while the script ran on a real tab here.
+      send({ type: 'result', id: data.id, result: res.data, newTabs, tabId });
     } else {
       console.log(res);
-      send({ type: 'error', id: data.id, error: res?.error || 'Unknown error', newTabs });
+      send({ type: 'error', id: data.id, error: res?.error || 'Unknown error', newTabs, tabId });
     }
   } catch (e) {
-    send({ type: 'error', id: data.id, error: { name: e.name || 'Error', message: e.message || String(e), stack: e.stack || '' } });
+    send({ type: 'error', id: data.id, error: { name: e.name || 'Error', message: e.message || String(e), stack: e.stack || '' }, tabId });
   } finally {
     chrome.tabs.onCreated.removeListener(onCreated);
   }
@@ -652,8 +2919,14 @@ function connectWS() {
   connectInFlight = true;
   ws = null;
   console.log('[TMWD-WS] Connecting to', WS_URL);
+  // Capture the socket we are about to create. Every handler below closes over
+  // `self`, not the global `ws`: a reconnect may have replaced `ws` with a new
+  // socket by the time this one's onclose/onerror fires, and the old handler
+  // must NOT null out the new connection or tear down its keepalive.
+  let self;
   try {
-    ws = new WebSocket(WS_URL);
+    self = new WebSocket(WS_URL);
+    ws = self;
   } catch (e) {
     console.error('[TMWD-WS] Constructor error:', e);
     ws = null;
@@ -661,7 +2934,18 @@ function connectWS() {
     scheduleProbe();
     return;
   }
+  // A TCP connect can hang silently (VPN up, bridge half-dead): the socket
+  // sits in CONNECTING forever and every ensureConnected() call bails on
+  // readyState<=1, so nothing ever retries. Cap the attempt; onclose will
+  // route back through the probe alarm.
+  const connectTimer = setTimeout(() => {
+    if (self.readyState === WebSocket.CONNECTING) {
+      try { self.close(); } catch (_) {}
+    }
+  }, 5000);
   ws.onopen = async () => {
+    clearTimeout(connectTimer);
+    if (ws !== self) return; // a newer socket owns the slot
     connectInFlight = false;
     console.log('[TMWD-WS] Connected!');
     // Seed the pong clock so the zombie watchdog has a baseline; the bridge's
@@ -669,16 +2953,24 @@ function connectWS() {
     // watchdog's `lastPongAt &&` guard would never arm.
     lastPongAt = Date.now();
     scheduleKeepalive(); // Keep SW alive while connected
+    // Arm the probe alarm even on a healthy connection: if the SW is evicted
+    // while the socket is OPEN, only an alarm can wake us back up, and a
+    // healthy probe tick is a cheap no-op.
+    scheduleProbe();
     try {
-      const sock = ws;
       const clientId = await getClientId();
       const tabs = (await chrome.tabs.query({})).filter(t => isScriptable(t.url));
-      if (!sock || sock.readyState !== WebSocket.OPEN) return; // died during await
-      sock.send(JSON.stringify({
+      if (self !== ws || self.readyState !== WebSocket.OPEN) return; // died during await
+      self.send(JSON.stringify({
         type: 'ext_ready',
         clientId,
         browser: getBrowserType(),
-        tabs: tabs.map(t => ({ id: t.id, url: t.url, title: t.title }))
+        tabs: await Promise.all(tabs.map(async t => ({
+          id: t.id,
+          url: t.url,
+          title: t.title,
+          generation: await tabGenerationFor(t.id),
+        })))
       }));
       console.log('[TMWD-WS] Sent ext_ready with', tabs.length, 'tabs as', clientId);
     } catch (e) {
@@ -686,11 +2978,12 @@ function connectWS() {
     }
   };
   ws.onmessage = async (event) => {
+    if (ws !== self) return; // a newer socket owns the slot
     // This handler awaits, and the bridge can die mid-await: onclose nulls the
     // global `ws`, so a later send() would throw DOMException on a dead socket.
     // Capture the socket we arrived on and only answer if it's still open --
     // the reply is worthless anyway once the bridge is gone.
-    const sock = ws;
+    const sock = self;
     const reply = (obj) => {
       if (sock && sock.readyState === WebSocket.OPEN) sock.send(JSON.stringify(obj));
     };
@@ -728,9 +3021,14 @@ function connectWS() {
     }
   };
   ws.onclose = () => {
+    clearTimeout(connectTimer);
+    if (ws !== self) return; // a newer connection owns the slot; leave it be
     console.log('[TMWD-WS] Disconnected');
     ws = null;
     connectInFlight = false;
+    // Stop holding the worker alive for a socket that's gone; the probe alarm
+    // takes over reconnect duty and survives eviction.
+    stopKeepalive();
     scheduleProbe();
   };
   ws.onerror = (e) => {
@@ -740,9 +3038,14 @@ function connectWS() {
 }
 
 // Initial connect + wake-up hooks
+void installPermissionLeaseRecoveryHooks();
 ensureConnected('boot');
-chrome.runtime.onStartup.addListener(() => ensureConnected('onStartup'));
-chrome.runtime.onInstalled.addListener(() => ensureConnected('onInstalled'));
+chrome.runtime.onStartup.addListener(() => {
+  ensureConnected('onStartup');
+});
+chrome.runtime.onInstalled.addListener(() => {
+  ensureConnected('onInstalled');
+});
 // Long-lived port from content scripts. Establishing a port is a stronger SW
 // wake signal than sendMessage — and merely re-instantiating the dead SW runs
 // this file top-to-bottom, hitting ensureConnected('boot') above. We also kick
@@ -782,27 +3085,36 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 // Sync tab list on changes — also re-open WS if SW slept
 async function sendTabsUpdate() {
   ensureConnected('tabs-event');
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
   // The check above goes stale across these awaits, so re-check the SAME socket
   // right before sending rather than trusting the earlier readyState.
   const sock = ws;
-  const tabs = (await chrome.tabs.query({})).filter(t => isScriptable(t.url) && !/streamlit/i.test(t.title));
   try {
+    const tabs = (await chrome.tabs.query({})).filter(t => isScriptable(t.url) && !/streamlit/i.test(t.title));
+    if (!sock || sock.readyState !== WebSocket.OPEN) return;
     const clientId = await getClientId();
     if (!sock || sock.readyState !== WebSocket.OPEN) return;
     sock.send(JSON.stringify({
       type: 'tabs_update',
       clientId,
       browser: getBrowserType(),
-      tabs: tabs.map(t => ({ id: t.id, url: t.url, title: t.title }))
+      tabs: await Promise.all(tabs.map(async t => ({
+        id: t.id,
+        url: t.url,
+        title: t.title,
+        generation: await tabGenerationFor(t.id),
+      })))
     }));
   } catch (e) {
-    console.error('[TMWD-WS] tabs_update send failed', e);
+    console.error('[TMWD-WS] tabs_update failed', e);
   }
 }
 chrome.tabs.onUpdated.addListener((_, changeInfo) => {
   if (changeInfo.status === 'complete' || changeInfo.url) sendTabsUpdate();
 });
-chrome.tabs.onRemoved.addListener(() => sendTabsUpdate());
-chrome.tabs.onCreated.addListener(() => sendTabsUpdate());
+chrome.tabs.onRemoved.addListener((tabId) => {
+  void forgetTabGeneration(tabId).finally(() => sendTabsUpdate());
+});
+chrome.tabs.onCreated.addListener((tab) => {
+  void scheduleNewTabGeneration(tab.id).finally(() => sendTabsUpdate());
+});
 chrome.tabs.onActivated.addListener(() => ensureConnected('tab-activated'));

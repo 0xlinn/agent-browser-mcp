@@ -1,6 +1,22 @@
-// Disable alert/confirm/prompt to prevent page JS from blocking extension
+// Suppress alert/confirm/prompt so page JS can't block automation.
+//
+// This runs in the MAIN world on every page at document_start, so it MUST NOT
+// change behaviour during ordinary human browsing. It used to replace confirm()
+// with a function that always returned true — which silently auto-accepted the
+// user's own "Delete this repository?" / "Discard unsaved changes?" dialogs.
+//
+// Now the natives stay in place until automation explicitly turns suppression
+// on for this tab. The injected script preamble sets window.__tmwd_suppress_until
+// (same MAIN world) to a deadline, so suppression expires by itself even if the
+// command never gets to clear it.
 (function() {
   const _log = console.log.bind(console);
+  const native = {
+    alert: window.alert,
+    confirm: window.confirm,
+    prompt: window.prompt,
+  };
+
   function toast(type, msg) {
     _log('[TMWD] ' + type + ' suppressed:', msg);
     try {
@@ -18,7 +34,55 @@
       setTimeout(() => { d.remove(); }, 3600);
     } catch(e) {}
   }
-  window.alert = function(msg) { toast('alert', msg); };
-  window.confirm = function(msg) { toast('confirm', msg); return true; };
-  window.prompt = function(msg, def) { toast('prompt', msg); return def || null; };
+
+  function activeScope() {
+    const now = Date.now();
+    const scopes = Array.isArray(window.__tmwd_dialog_scopes)
+      ? window.__tmwd_dialog_scopes.filter(scope => scope && now < scope.deadline &&
+          (scope.policy === 'dismiss' || scope.policy === 'accept'))
+      : [];
+    if (Array.isArray(window.__tmwd_dialog_scopes)) {
+      window.__tmwd_dialog_scopes = scopes;
+    }
+    if (scopes.length) return scopes[scopes.length - 1];
+    return null;
+  }
+
+  function recordDialog(scope, type, msg, defaultPrompt) {
+    const records = Array.isArray(window.__tmwd_dialog_records)
+      ? window.__tmwd_dialog_records : [];
+    records.push({
+      token: scope.token,
+      policy: scope.policy,
+      type,
+      message: String(msg ?? ''),
+      defaultPrompt: defaultPrompt === undefined ? '' : String(defaultPrompt),
+      openedAt: Date.now(),
+    });
+    window.__tmwd_dialog_records = records.slice(-50);
+  }
+
+  // Note the asymmetry in the fallbacks: when NOT automating we defer to the
+  // native dialog, so the user's own confirmations behave exactly as the page
+  // intended. Only under automation do we answer on their behalf.
+  window.alert = function(msg) {
+    const scope = activeScope();
+    if (!scope) return native.alert.call(window, msg);
+    recordDialog(scope, 'alert', msg);
+    toast('alert', msg);
+  };
+  window.confirm = function(msg) {
+    const scope = activeScope();
+    if (!scope) return native.confirm.call(window, msg);
+    recordDialog(scope, 'confirm', msg);
+    toast('confirm', msg);
+    return scope.policy === 'accept';
+  };
+  window.prompt = function(msg, def) {
+    const scope = activeScope();
+    if (!scope) return native.prompt.call(window, msg, def);
+    recordDialog(scope, 'prompt', msg, def);
+    toast('prompt', msg);
+    return scope.policy === 'accept' ? (def ?? '') : null;
+  };
 })();
