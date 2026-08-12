@@ -3,8 +3,8 @@
 The WS port keeps web pages out with an Origin prefix check, which works there
 because a page cannot forge chrome-extension://. /link has no such handle: any
 local process can POST an execute_js and run arbitrary JS in the user's
-logged-in tabs. A shared token closes that, and is opt-in so existing setups
-without one keep working.
+logged-in tabs. Every ABM process therefore reads one persistent per-user token;
+editors do not supply or rotate it.
 
 Every test here binds its OWN ports (see conftest's link_bridge fixture) and
 never touches the bridge daemon the user has running.
@@ -42,10 +42,9 @@ def test_authorization_wins_over_x_bridge_token():
     assert got == TOKEN
 
 
-def test_no_token_configured_lets_everything_through(monkeypatch):
-    """Back-compat: without the env var the bridge must behave as it always did."""
-    monkeypatch.delenv(T.TOKEN_ENV, raising=False)
-    T.require_link_token({})              # must not raise
+def test_explicitly_disabled_auth_lets_everything_through(monkeypatch):
+    monkeypatch.setenv(T.TOKEN_AUTH_ENV, "off")
+    T.require_link_token({})
     T.require_link_token({"Authorization": "Bearer nonsense"})
 
 
@@ -77,11 +76,11 @@ def test_a_prefix_of_the_token_is_not_enough(monkeypatch):
 
 
 def test_whitespace_only_env_counts_as_unset(monkeypatch):
-    """Otherwise `set VAR= ` would lock out every client with an unguessable
-    secret nobody can reproduce."""
+    """A blank legacy env value creates a persistent token instead of disabling auth."""
     monkeypatch.setenv(T.TOKEN_ENV, "   ")
-    assert T.bridge_token() == ""
-    T.require_link_token({})
+    token = T.bridge_token()
+    assert token
+    assert T.bridge_token_path().read_text(encoding="utf-8").strip() == token
 
 
 # --- end to end over real HTTP, on a throwaway port ------------------------
@@ -92,12 +91,46 @@ def _post(port, body, headers=None, timeout=5):
 
 
 class TestUnauthenticatedBridge:
-    """No token configured: the historical behaviour, unchanged."""
+    """Explicit auth=off keeps the historical unauthenticated behaviour."""
 
     def test_bare_post_is_served(self, link_bridge_open):
         r = _post(link_bridge_open.port, {"cmd": "get_all_sessions"})
         assert r.status_code == 200
         assert r.json()["r"] == []
+
+
+@pytest.fixture(autouse=True)
+def isolated_token_file(tmp_path, monkeypatch):
+    monkeypatch.setenv(T.TOKEN_FILE_ENV, str(tmp_path / "bridge-token"))
+    monkeypatch.delenv(T.TOKEN_AUTH_ENV, raising=False)
+
+
+def test_legacy_env_token_is_migrated_once_and_file_wins(monkeypatch, tmp_path):
+    path = tmp_path / "bridge-token"
+    monkeypatch.setenv(T.TOKEN_ENV, TOKEN)
+    assert T.bridge_token() == TOKEN
+    assert path.read_text(encoding="utf-8").strip() == TOKEN
+    monkeypatch.setenv(T.TOKEN_ENV, "rotated-in-editor")
+    assert T.bridge_token() == TOKEN
+
+
+def test_fresh_install_generates_one_stable_token(monkeypatch):
+    monkeypatch.delenv(T.TOKEN_ENV, raising=False)
+    first = T.bridge_token()
+    second = T.bridge_token()
+    assert len(first) >= 32
+    assert second == first
+
+
+def test_reinstall_reuses_leftover_token_despite_stale_editor_env(monkeypatch):
+    """Uninstalling packages/extensions leaves user data; that is reusable state."""
+    path = T.bridge_token_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("token-from-previous-install\n", encoding="utf-8")
+    monkeypatch.setenv(T.TOKEN_ENV, "stale-token-from-an-editor")
+
+    assert T.bridge_token() == "token-from-previous-install"
+    assert path.read_text(encoding="utf-8") == "token-from-previous-install\n"
 
 
 class TestUnknownCommandIsAnError:
@@ -209,22 +242,28 @@ class TestRemoteClientCarriesTheToken:
 
     def test_remote_cmd_without_the_token_says_what_is_wrong(
             self, link_bridge_auth, monkeypatch):
-        """A 401 body is not JSON; .json() would raise JSONDecodeError and hide
-        the cause. The error has to name the env var."""
+        """A client without editor env reads the same persistent token file."""
         monkeypatch.delenv(T.TOKEN_ENV, raising=False)
         client = _remote_client(link_bridge_auth.port)
-        with pytest.raises(PermissionError, match=T.TOKEN_ENV):
-            client._remote_cmd({"cmd": "get_all_sessions"})
+        assert client._remote_cmd({"cmd": "get_all_sessions"})["r"] == []
 
     def test_remote_cmd_with_a_stale_token_also_reports_401(
             self, link_bridge_auth, monkeypatch):
+        """Once migrated, a stale editor env cannot replace the shared token."""
         monkeypatch.setenv(T.TOKEN_ENV, "an-old-token")
         client = _remote_client(link_bridge_auth.port)
-        with pytest.raises(PermissionError):
+        assert client._remote_cmd({"cmd": "get_all_sessions"})["r"] == []
+
+    def test_token_file_changed_under_old_bridge_reports_restart_hint(
+            self, link_bridge_auth):
+        T.bridge_token_path().write_text("new-token\n", encoding="utf-8")
+        client = _remote_client(link_bridge_auth.port)
+        with pytest.raises(PermissionError, match="重启旧桥"):
             client._remote_cmd({"cmd": "get_all_sessions"})
 
     def test_no_token_anywhere_still_works(self, link_bridge_open, monkeypatch):
         monkeypatch.delenv(T.TOKEN_ENV, raising=False)
+        monkeypatch.setenv(T.TOKEN_AUTH_ENV, "off")
         client = _remote_client(link_bridge_open.port)
         assert client._remote_cmd({"cmd": "get_all_sessions"})["r"] == []
 

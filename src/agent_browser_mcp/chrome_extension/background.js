@@ -137,6 +137,47 @@ async function forgetTabGeneration(tabId) {
   await persistTabGenerations();
 }
 
+async function validateTabCloseGenerations(tabIds, expected) {
+  if (!expected || typeof expected !== 'object') return null;
+  for (const tabId of tabIds) {
+    const expectedGeneration = expected[String(tabId)];
+    if (typeof expectedGeneration !== 'string') {
+      return `missing expected generation for tab ${tabId}`;
+    }
+    const currentGeneration = await tabGenerationFor(tabId);
+    if (currentGeneration !== expectedGeneration) {
+      return `tab ${tabId} lifecycle generation changed; refusing close`;
+    }
+  }
+  return null;
+}
+
+async function closeTabsWithGenerations(tabIds, expected) {
+  const liveIds = [];
+  const alreadyGone = [];
+  for (const tabId of tabIds) {
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (!tab) {
+      alreadyGone.push(tabId);
+      continue;
+    }
+    if (expected && typeof expected === 'object') {
+      const expectedGeneration = expected[String(tabId)];
+      if (typeof expectedGeneration !== 'string') {
+        throw new Error(`missing expected generation for tab ${tabId}`);
+      }
+      const currentGeneration = await tabGenerationFor(tabId);
+      if (currentGeneration !== expectedGeneration) {
+        throw new Error(`tab ${tabId} lifecycle generation changed; refusing close`);
+      }
+    }
+    liveIds.push(tabId);
+  }
+  // Validate every live tab before removing any member of the batch.
+  if (liveIds.length) await chrome.tabs.remove(liveIds);
+  return { closed: liveIds, alreadyGone };
+}
+
 // --- Temporary, origin-scoped site-permission leases ----------------------
 const PERMISSION_LEASES_KEY = 'tmwdPermissionLeases';
 const PERMISSION_ALARM_PREFIX = 'tmwd-permission:';
@@ -1630,7 +1671,8 @@ async function navigateWithDialogPolicy(msg) {
         tab = await chrome.tabs.get(tabId).catch(() => tab);
       }
     }
-    const status = classifyNavigationOutcome({
+    const isDownload = Boolean(navigation?.isDownload);
+    const status = isDownload ? 'triggered' : classifyNavigationOutcome({
       firstKind: first.kind,
       navigationKind,
       dialog,
@@ -1641,6 +1683,11 @@ async function navigateWithDialogPolicy(msg) {
       ok: true,
       data: {
         status,
+        ...(isDownload ? {
+          type: 'download',
+          is_download: true,
+          hint: 'The browser accepted this as a download. ERR_ABORTED is normal for a download navigation; use download_file when the final local path is required.',
+        } : {}),
         dialog,
         dialog_action: dialog ? action : undefined,
         dialog_observed: Boolean(dialog),
@@ -1673,6 +1720,174 @@ async function navigateWithDialogPolicy(msg) {
       debuggerLease = null;
     }
   }
+}
+
+function boundedDownloadTimeout(value, fallback = 60000) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.max(1, Math.min(Math.floor(parsed), 30 * 60 * 1000));
+}
+
+function downloadItemResult(item, fallbackStatus = 'in_progress') {
+  const terminalFallback = fallbackStatus === 'complete' || fallbackStatus === 'interrupted';
+  // onChanged is authoritative for a terminal transition. downloads.search()
+  // can briefly return the previous in_progress snapshot after that event.
+  const state = terminalFallback ? fallbackStatus : (item?.state || fallbackStatus);
+  const status = state === 'complete'
+    ? 'completed' : state === 'interrupted' ? 'failed' : 'in_progress';
+  const result = {
+    status,
+    download_id: item?.id,
+    bytes_received: Number(item?.bytesReceived) || 0,
+    total_bytes: Number(item?.totalBytes) || 0,
+  };
+  if (status === 'completed' && item?.filename) result.path = item.filename;
+  if (status === 'failed') {
+    result.error = item?.error || 'download interrupted';
+    result.hint = 'The browser interrupted the download; inspect the error and retry download_file if appropriate.';
+  }
+  return result;
+}
+
+async function downloadSnapshot(downloadId, fallbackStatus = 'in_progress') {
+  const matches = await chrome.downloads.search({ id: downloadId });
+  const item = matches.find(candidate => candidate.id === downloadId) || { id: downloadId };
+  return downloadItemResult(item, fallbackStatus);
+}
+
+async function settledDownloadSnapshot(downloadId, fallbackStatus) {
+  const attempts = fallbackStatus === 'complete' ? 5 : 1;
+  let snapshot;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    snapshot = await downloadSnapshot(downloadId, fallbackStatus);
+    if (fallbackStatus !== 'complete' || snapshot.path) {
+      return snapshot;
+    }
+    if (attempt < attempts - 1) {
+      // onChanged can precede the search index's final filename by a few ticks.
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+  }
+  throw new Error('download completed but Chrome did not expose the final local path');
+}
+
+function downloadFailureResult(code, error, downloadId) {
+  return {
+    ok: true,
+    data: {
+      status: 'failed',
+      code,
+      error,
+      ...(Number.isInteger(downloadId) ? { download_id: downloadId } : {}),
+    },
+  };
+}
+
+async function handleDownloadCommand(msg) {
+  if (msg.method !== 'download') {
+    return { ok: false, code: 'unknown_download_method', error: `Unknown downloads method: ${msg.method}` };
+  }
+  if (typeof msg.url !== 'string' || !/^https?:\/\//i.test(msg.url)) {
+    return { ok: false, code: 'invalid_download_url', error: 'downloads.download requires an http(s) URL' };
+  }
+  const options = {
+    url: msg.url,
+    conflictAction: msg.conflictAction === 'uniquify' ? 'uniquify' : 'overwrite',
+    saveAs: false,
+  };
+  if (typeof msg.filename === 'string' && msg.filename) options.filename = msg.filename;
+  let downloadId;
+  try {
+    downloadId = await chrome.downloads.download(options);
+    if (!Number.isInteger(downloadId)) {
+      return { ok: false, code: 'download_not_started', error: 'The browser did not return a download id' };
+    }
+    if (msg.wait === false) {
+      return { ok: true, data: await downloadSnapshot(downloadId) };
+    }
+    const timeoutMs = boundedDownloadTimeout(msg.timeoutMs);
+    return await new Promise(resolve => {
+      let settled = false;
+      let timer = null;
+      const cleanup = () => {
+        if (timer !== null) clearTimeout(timer);
+        chrome.downloads.onChanged.removeListener(onChanged);
+      };
+      const finish = async (fallbackStatus, fallbackError = null) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        try {
+          const snapshot = await settledDownloadSnapshot(downloadId, fallbackStatus);
+          if (fallbackStatus === 'interrupted' && fallbackError) snapshot.error = fallbackError;
+          resolve({ ok: true, data: snapshot });
+        } catch (error) {
+          resolve(downloadFailureResult(
+            'download_status_failed', error.message || String(error), downloadId,
+          ));
+        }
+      };
+      const onChanged = delta => {
+        if (delta.id !== downloadId) return;
+        const state = delta.state?.current;
+        if (state === 'complete' || state === 'interrupted' || delta.error?.current) {
+          void finish(
+            state === 'complete' ? 'complete' : 'interrupted',
+            delta.error?.current || null,
+          );
+        }
+      };
+      timer = setTimeout(() => void finish('in_progress'), timeoutMs);
+      chrome.downloads.onChanged.addListener(onChanged);
+      // Reconcile immediately after registering the listener. A tiny download
+      // can finish between downloads.download() and listener installation;
+      // onChanged covers what follows, while this search covers that gap.
+      void downloadSnapshot(downloadId).then(snapshot => {
+        if (snapshot.status === 'completed') void finish('complete');
+        else if (snapshot.status === 'failed') void finish('interrupted');
+      }).catch(error => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(downloadFailureResult(
+          'download_status_failed', error.message || String(error), downloadId,
+        ));
+      });
+    });
+  } catch (error) {
+    return downloadFailureResult(
+      'download_failed', error.message || String(error), downloadId,
+    );
+  }
+}
+
+async function createTabAck(msg) {
+  // Creation acknowledgement must not wait for the destination document to
+  // finish loading.  The caller has one total deadline for both this transport
+  // reply and the exact session+generation registration; consuming that same
+  // budget here makes a successful chrome.tabs.create look like a timeout and
+  // leaves the caller without the ownership capability needed for cleanup.
+  const tab = await chrome.tabs.create({
+    url: msg.url || 'about:blank',
+    active: msg.active !== false,
+  });
+  // Reuse a generation already assigned by onCreated. If its callback has not
+  // run yet, tabGenerationFor establishes the generation and onCreated will
+  // observe it instead of replacing the ACK's lifecycle identity.
+  let generation;
+  try { generation = await tabGenerationFor(tab.id); } catch (_) {}
+  if (!generation) generation = await scheduleNewTabGeneration(tab.id);
+  void sendTabsUpdate();
+  const currentUrl = tab.pendingUrl || tab.url || msg.url || 'about:blank';
+  return { ok: true, data: {
+    id: tab.id,
+    generation,
+    url: currentUrl,
+    title: tab.title || '',
+    windowId: tab.windowId,
+    status: tab.status || 'unknown',
+    load_ready: Boolean(tab.status === 'complete' && currentUrl),
+  } };
 }
 
 async function handleExtMessage(msg, sender) {
@@ -1723,6 +1938,7 @@ async function handleExtMessage(msg, sender) {
     return { ok: true, data: { cleared: true } };
   }
   if (msg.cmd === 'cookies') return await handleCookies(msg, sender);
+  if (msg.cmd === 'downloads') return await handleDownloadCommand(msg);
   if (msg.cmd === 'cdp') return await handleCDP(msg, sender);
   if (msg.cmd === 'batch') return await handleBatch(msg, sender);
   if (msg.cmd === 'tabs') {
@@ -1748,34 +1964,18 @@ async function handleExtMessage(msg, sender) {
       } else if (msg.method === 'close') {
         // Works on chrome-extension:// pages too, which never become sessions
         // and so can't be closed through any session-scoped path.
-        await chrome.tabs.remove(Array.isArray(msg.tabId) ? msg.tabId : [msg.tabId]);
-        return { ok: true };
+        const tabIds = Array.isArray(msg.tabId) ? msg.tabId : [msg.tabId];
+        // chrome.tabs is the existence truth even for PDF/restricted pages
+        // that never register a scriptable ABM session. Validate the whole
+        // batch before removing anything so native-id reuse cannot misclose.
+        return { ok: true, data: await closeTabsWithGenerations(
+          tabIds, msg.expectedGenerations,
+        ) };
       } else if (msg.method === 'create') {
         // Native tab creation — runs in the SW, so it needs NO existing tab.
         // This replaces the old GM_openInTab path (a Tampermonkey API that
         // does not exist in a plain extension, so open_new_tab always threw).
-        let tab = await chrome.tabs.create({ url: msg.url || 'about:blank', active: msg.active !== false });
-        const pendingGeneration = tabGenerationAssignments.get(tab.id);
-        if (pendingGeneration) await pendingGeneration;
-        const waitMs = Math.max(100, Math.min(Number(msg.timeoutMs) || 15000, 30000));
-        const deadline = Date.now() + waitMs;
-        while (tab && Date.now() < deadline) {
-          const currentUrl = tab.pendingUrl || tab.url || '';
-          if (tab.status === 'complete' && currentUrl) break;
-          await new Promise(resolve => setTimeout(resolve, 100));
-          tab = await chrome.tabs.get(tab.id).catch(() => null);
-        }
-        if (tab) await sendTabsUpdate();
-        const currentUrl = tab?.pendingUrl || tab?.url || msg.url;
-        return { ok: true, data: {
-          id: tab?.id,
-          generation: await tabGenerationFor(tab.id),
-          url: currentUrl,
-          title: tab?.title || '',
-          windowId: tab?.windowId,
-          status: tab?.status || 'unknown',
-          load_ready: Boolean(tab && tab.status === 'complete' && currentUrl),
-        } };
+        return await createTabAck(msg);
       } else {
         // all:true also reveals chrome-extension:// pages. They never become
         // sessions (content scripts can't run there), but chrome.debugger CAN
@@ -2038,16 +2238,16 @@ async function handleExtMessage(msg, sender) {
     'site_permission', 'dialog_state', 'handle_dialog', 'navigate',
     'set_dialog_policy', 'clear_dialog_policy', 'cookies', 'cdp', 'batch',
     'tabs', 'debugger_targets', 'management', 'bookmarks', 'call_extension',
-    'network_capture', 'console', 'bridge_status',
+    'network_capture', 'console', 'downloads', 'bridge_status',
   ];
   if (msg.cmd === 'bridge_status') {
-    return { ok: true, data: { version: '2026.08.11-lab', knownCommands } };
+    return { ok: true, data: { version: '2026.08.12-pass2-final', knownCommands } };
   }
   return {
     ok: false,
     code: 'unknown_cmd',
     error: `Unknown extension cmd: ${msg.cmd}`,
-    version: '2026.08.11-lab',
+    version: '2026.08.12-pass2-final',
     knownCommands,
     hint: 'The extension command router is alive; compare knownCommands and reload the unpacked extension if this server expects a newer build.',
   };
@@ -3115,6 +3315,9 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   void forgetTabGeneration(tabId).finally(() => sendTabsUpdate());
 });
 chrome.tabs.onCreated.addListener((tab) => {
-  void scheduleNewTabGeneration(tab.id).finally(() => sendTabsUpdate());
+  void (async () => {
+    await loadTabGenerations();
+    if (!tabGenerations.has(tab.id)) await scheduleNewTabGeneration(tab.id);
+  })().finally(() => sendTabsUpdate());
 });
 chrome.tabs.onActivated.addListener(() => ensureConnected('tab-activated'));

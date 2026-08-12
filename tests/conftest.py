@@ -68,12 +68,14 @@ def _spawn_test_bridge(token, monkeypatch):
     """
     import time
 
-    from agent_browser_mcp.tmwebdriver import TMWebDriver, TOKEN_ENV
+    from agent_browser_mcp.tmwebdriver import TMWebDriver, TOKEN_AUTH_ENV, TOKEN_ENV
 
     if token:
+        monkeypatch.delenv(TOKEN_AUTH_ENV, raising=False)
         monkeypatch.setenv(TOKEN_ENV, token)
     else:
         monkeypatch.delenv(TOKEN_ENV, raising=False)
+        monkeypatch.setenv(TOKEN_AUTH_ENV, "off")
     base = _free_port_base()
     d = TMWebDriver.__new__(TMWebDriver)
     d.host, d.port = "127.0.0.1", base
@@ -105,7 +107,7 @@ def link_bridge_auth(monkeypatch):
 
 @pytest.fixture
 def link_bridge_open(monkeypatch):
-    """A test bridge with no token configured: the pre-existing behaviour."""
+    """A test bridge with authentication explicitly disabled."""
     return _spawn_test_bridge(None, monkeypatch)
 
 
@@ -137,6 +139,7 @@ def scratch_session(driver):
 
     result = S.open_new_tab("https://example.com/")
     tab_id = result["result"]["data"]["id"]
+    owner_id = result.get("owner_id")
 
     sid = None
     for _ in range(20):
@@ -162,6 +165,10 @@ def scratch_session(driver):
     yield sid
 
     try:
-        S.close_tabs(tab_id)
+        S.close_tabs(
+            tab_id,
+            session_id=sid,
+            owner_id=owner_id,
+        )
     except Exception:
         pass

@@ -7,9 +7,12 @@ import json
 import os
 import random
 import re
+import secrets
+import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -59,6 +62,8 @@ mcp = FastMCP(
         "Several browsers can be connected at once; list_tabs shows a browser field per tab. "
         "Before acting, pick the target explicitly with switch_tab(browser='chrome'|'edge') or a full "
         "session_id (a 'client:tabId' string - pass it verbatim, never split it). "
+        "Tabs that existed before the task are user-owned: do not close or navigate them by default. "
+        "For mutating work use open_new_tab, keep its owner_id, and close that owned tab in cleanup. "
         "If a result carries status='no_response', switched_session, or bridge_error: the tab slept, "
         "reconnected, or the bridge blipped - run list_tabs, switch_tab to the right target, then retry; "
         "re-run scripts with side effects only after scan_page confirms they did not land."
@@ -80,6 +85,97 @@ _DEFAULT_AUTO_BEFOREUNLOAD_HOSTS = (
 _LAB_APPROVAL_OWNERS: dict[str, Any] = {}
 _LAB_PHYSICAL_APPROVALS: set[str] = set()
 _LAB_SITE_PERMISSION_APPROVALS: set[str] = set()
+
+
+class _TabOwnershipRegistry:
+    """Process-local capabilities for tabs created by this MCP server.
+
+    The shared bridge sees every browser tab, but each editor conversation gets
+    its own MCP process and therefore its own registry.  The random owner_id is
+    an additional capability check inside a process; the lifecycle generation
+    prevents a reused native tab id from inheriting an earlier ownership claim.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._records: dict[str, dict[str, str]] = {}
+
+    @staticmethod
+    def _new_owner_id() -> str:
+        return f"abm_owner_{secrets.token_urlsafe(18)}"
+
+    def register(
+        self,
+        session_id: str,
+        generation: str,
+        *,
+        owner_id: Optional[str] = None,
+    ) -> dict[str, str]:
+        sid = str(session_id)
+        gen = str(generation)
+        capability = str(owner_id).strip() if owner_id is not None else self._new_owner_id()
+        if not capability:
+            raise ValueError("owner_id must not be empty")
+        record = {
+            "session_id": sid,
+            "generation": gen,
+            "owner_id": capability,
+            "opener": "agent",
+        }
+        with self._lock:
+            self._records[sid] = record
+        return dict(record)
+
+    def validate(
+        self,
+        session_ids: list[str],
+        *,
+        owner_id: Optional[str],
+        live_sessions: Optional[list[dict[str, Any]]] = None,
+    ) -> dict[str, str]:
+        capability = str(owner_id).strip() if owner_id is not None else ""
+        if not capability:
+            raise PermissionError(
+                "close_tabs refused: owner_id is required when only_if_agent_owned=true; "
+                "use the capability returned by open_new_tab"
+            )
+        expected: dict[str, str] = {}
+        live_by_id = {
+            str(item.get("id")): item for item in (live_sessions or [])
+        }
+        with self._lock:
+            for sid in session_ids:
+                record = self._records.get(sid)
+                if record is None:
+                    raise PermissionError(
+                        f"close_tabs refused: {sid} is not owned by this MCP task"
+                    )
+                if record["owner_id"] != capability:
+                    raise PermissionError(
+                        f"close_tabs refused: owner_id does not match {sid}"
+                    )
+                # A positively registered live session can reject a reused id
+                # early. Absence is not proof of closure: PDF, restricted URLs,
+                # and a reconnecting content script may have no session while
+                # the native Chrome tab still exists.
+                live = live_by_id.get(sid)
+                if live is not None and live.get("generation") is not None:
+                    if str(live["generation"]) != record["generation"]:
+                        raise PermissionError(
+                            f"close_tabs refused: {sid} lifecycle generation changed"
+                        )
+                expected[str(_split_session_target(sid)[1])] = record["generation"]
+        return expected
+
+    def release(self, session_ids: list[str], *, owner_id: str) -> None:
+        with self._lock:
+            for sid in session_ids:
+                record = self._records.get(sid)
+                if record and record["owner_id"] == owner_id:
+                    self._records.pop(sid, None)
+
+
+_TAB_OWNERSHIP = _TabOwnershipRegistry()
 
 
 def _env_enabled(name: str) -> bool:
@@ -131,6 +227,7 @@ _mcp_tool = mcp.tool
 
 
 def _threaded_tool(*d_args: Any, **d_kwargs: Any):
+    serialize = bool(d_kwargs.pop("serialize", True))
     decorator = _mcp_tool(*d_args, **d_kwargs)
 
     def wrap(fn):
@@ -140,6 +237,8 @@ def _threaded_tool(*d_args: Any, **d_kwargs: Any):
         @functools.wraps(fn)
         async def runner(*args: Any, **kwargs: Any):
             def _run():
+                if not serialize:
+                    return fn(*args, **kwargs)
                 with _TOOL_LOCK:
                     return fn(*args, **kwargs)
 
@@ -678,20 +777,83 @@ def list_all_tabs(session_id: Optional[str] = None) -> dict[str, Any]:
 @mcp.tool(
     description=(
         "Close one or more tabs by native tab id or composite session_id. Accepts a single "
-        "identifier or a list; identifiers in one call must belong to the same browser."
+        "identifier or a list; identifiers in one call must belong to the same browser. "
+        "By default it closes only tabs created by this MCP task and requires the owner_id "
+        "returned by open_new_tab; lifecycle generations are checked before removal. Set "
+        "only_if_agent_owned=false only for an explicit operator request to close a user tab."
     )
 )
 def close_tabs(
     tab_id: int | str | list[int | str],
     session_id: Optional[str] = None,
+    owner_id: Optional[str] = None,
+    only_if_agent_owned: bool = True,
 ) -> dict[str, Any]:
     driver = require_driver()
     native_ids, client_id = _normalize_tab_targets(tab_id, session_id=session_id)
+    session_ids = [f"{client_id}:{native_id}" for native_id in native_ids]
+    expected_generations: dict[str, str] = {}
+    if only_if_agent_owned:
+        expected_generations = _TAB_OWNERSHIP.validate(
+            session_ids,
+            owner_id=owner_id,
+            live_sessions=active_sessions(fresh=True),
+        )
+    requested: int | list[int] = native_ids[0] if not isinstance(tab_id, list) else native_ids
     command_ids: int | list[int] = native_ids[0] if not isinstance(tab_id, list) else native_ids
-    result = driver.ext_cmd({"cmd": "tabs", "method": "close", "tabId": command_ids},
-                            client_id=client_id, timeout=20.0)
+    payload: dict[str, Any] = {
+        "cmd": "tabs",
+        "method": "close",
+        "tabId": command_ids,
+    }
+    if expected_generations:
+        payload["expectedGenerations"] = expected_generations
+    result = driver.ext_cmd(
+        payload, client_id=client_id, timeout=20.0
+    )
+    info = _extension_data(result)
+    if info.get("ok") is False:
+        raise RuntimeError(info.get("error") or "the browser refused to close the tab")
+    raw_closed = info.get("closed")
+    raw_already_gone = info.get("alreadyGone", info.get("already_gone"))
+    closed_ids = (
+        [int(value) for value in raw_closed]
+        if isinstance(raw_closed, list)
+        else list(native_ids)
+    )
+    already_gone_ids = (
+        [int(value) for value in raw_already_gone]
+        if isinstance(raw_already_gone, list)
+        else []
+    )
+    if only_if_agent_owned and owner_id is not None:
+        _TAB_OWNERSHIP.release(session_ids, owner_id=str(owner_id))
     invalidate_sessions_cache()
-    return {"status": "ok", "closed": command_ids, "result": result}
+    single = not isinstance(tab_id, list)
+    closed: int | list[int] = (
+        closed_ids[0] if single and closed_ids else [] if single else closed_ids
+    )
+    already_gone: int | list[int] = (
+        already_gone_ids[0]
+        if single and already_gone_ids
+        else [] if single else already_gone_ids
+    )
+    status = "already_gone" if only_if_agent_owned and not closed_ids and already_gone_ids else "ok"
+    closed_by = (
+        "user" if status == "already_gone"
+        else "agent" if only_if_agent_owned and closed_ids
+        else "none"
+    )
+    return {
+        "status": status,
+        "requested": requested,
+        "closed": closed,
+        "already_gone": already_gone,
+        "closed_by": closed_by,
+        "owner_id": str(owner_id) if only_if_agent_owned else None,
+        "only_if_agent_owned": bool(only_if_agent_owned),
+        "result": result,
+    }
 
 
 @mcp.tool(
@@ -784,11 +946,15 @@ def _session_url(session_id: str) -> str:
     return ""
 
 
-def _lab_auto_accepts_beforeunload(session_id: str) -> bool:
+def _lab_auto_accepts_beforeunload(
+    session_id: str,
+    session_url: Optional[str] = None,
+) -> bool:
     if _automation_mode() != "lab":
         return False
     try:
-        host = (urlsplit(_session_url(session_id)).hostname or "").lower()
+        current_url = _session_url(session_id) if session_url is None else session_url
+        host = (urlsplit(current_url).hostname or "").lower()
     except ValueError:
         return False
     return bool(host and any(marker in host for marker in _auto_beforeunload_hosts()))
@@ -809,37 +975,95 @@ def open_url(
     beforeunload: str = "dismiss",
     intent_leave: Optional[bool] = None,
 ) -> dict[str, Any]:
+    timeout = float(timeout)
+    if timeout <= 0:
+        raise ValueError("timeout must be greater than zero")
+    deadline = time.monotonic() + timeout
     policy = _validate_dialog_policy(beforeunload)
     driver = require_driver()
     prev_default = driver.default_session_id
-    target_sid = switch_session(session_id=session_id) if session_id is not None else switch_session()
+    session_budget = deadline - time.monotonic()
+    if session_budget <= 0:
+        raise TimeoutError("open_url total deadline exhausted before session resolution")
+    sessions = ensure_sessions(
+        timeout=session_budget,
+        fresh=True,
+        prune_default=False,
+    )
+    if deadline - time.monotonic() <= 0:
+        raise TimeoutError("open_url total deadline exhausted during session resolution")
+    if session_id is not None:
+        requested_sid = str(session_id)
+        target_session = next(
+            (item for item in sessions if str(item.get("id")) == requested_sid),
+            None,
+        )
+        if target_session is None:
+            raise RuntimeError(f"Session {requested_sid} not found")
+        target_sid = requested_sid
+        driver.default_session_id = target_sid
+    else:
+        current_sid = str(prev_default) if prev_default is not None else None
+        target_session = next(
+            (item for item in sessions if str(item.get("id")) == current_sid),
+            None,
+        )
+        if target_session is None:
+            candidates = sessions
+            preferred_browser = os.environ.get(
+                "AGENT_BROWSER_PREFERRED_BROWSER", ""
+            ).strip().lower()
+            if preferred_browser:
+                preferred = [
+                    item for item in sessions
+                    if str(item.get("browser", "")).lower() == preferred_browser
+                ]
+                if preferred:
+                    candidates = preferred
+            target_session = candidates[0]
+        target_sid = str(target_session["id"])
+        driver.default_session_id = target_sid
     client_id, tab_id = _split_session_target(target_sid)
     auto_policy = bool(
         policy == "dismiss" and intent_leave is not False
-        and _lab_auto_accepts_beforeunload(target_sid)
+        and _lab_auto_accepts_beforeunload(
+            target_sid, str(target_session.get("url") or "")
+        )
     )
     effective_policy = "accept" if auto_policy else policy
     fallback_used = False
     try:
         try:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("open_url total deadline exhausted before navigation")
             response = driver.ext_cmd(
                 {
                     "cmd": "navigate",
                     "tabId": tab_id,
                     "url": url,
                     "beforeunload": effective_policy,
-                    "timeoutMs": max(1, int(float(timeout) * 1000)),
+                    "timeoutMs": max(1, int(remaining * 1000)),
                 },
                 client_id=client_id,
-                timeout=timeout,
+                timeout=remaining,
             )
             result = _extension_data(response)
         except Exception as route_error:
-            if not (_unknown_command_error(route_error) or isinstance(route_error, TimeoutError)):
+            # A timed-out navigation has unknown outcome and may already have
+            # changed the page. Only an explicit unsupported-route response is
+            # safe to resend through CDP.
+            if not _unknown_command_error(route_error):
                 raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    "open_url total deadline exhausted before CDP fallback"
+                ) from route_error
             navigation = _direct_cdp(
                 "Page.navigate", {"url": url}, session_id=target_sid,
-                client_id=client_id, tab_id=tab_id, timeout=timeout,
+                client_id=client_id, tab_id=tab_id, timeout=remaining,
+                deadline=deadline,
             )
             fallback_used = True
             result = {
@@ -1053,6 +1277,25 @@ def _classify_navigation_result(
     out = dict(result)
     out.setdefault("requested_url", requested_url)
     out.setdefault("url", requested_url)
+    navigation = out.get("navigation")
+    is_download = bool(
+        out.get("is_download") is True
+        or out.get("isDownload") is True
+        or (isinstance(navigation, dict) and navigation.get("isDownload") is True)
+    )
+    if is_download:
+        out.update({
+            "type": "download",
+            "status": "triggered",
+            "is_download": True,
+        })
+        out.setdefault(
+            "hint",
+            "The browser accepted this as a download. net::ERR_ABORTED can be normal "
+            "when Page.navigate reports isDownload=true; use download_file for completion "
+            "status and the final local path.",
+        )
+        return out
     dialog = out.get("dialog")
     action = out.get("dialog_action")
     terminal_statuses = {
@@ -1197,12 +1440,13 @@ async def resolve_leave_dialog(
     }
 
 
-@mcp.tool(description="Open a real-browser tab and wait a bounded time for its exact lifecycle generation to register. Returns tab_id, session_id, generation, ready, URL, and load status so a reused native id cannot match a stale tab.")
+@mcp.tool(description="Open a real-browser tab and wait a bounded time for its exact lifecycle generation to register. A ready tab is registered as owned by this MCP task and returns owned=true plus a random owner_id capability; pass that owner_id to close_tabs during cleanup. Returns tab_id, session_id, generation, ready, URL, and load status so a reused native id cannot match a stale tab.")
 def open_new_tab(
     url: str,
     timeout: float = 15.0,
     active: bool = True,
     session_id: Optional[str] = None,
+    owner_id: Optional[str] = None,
 ) -> dict[str, Any]:
     driver = require_driver()
     if timeout <= 0:
@@ -1212,6 +1456,8 @@ def open_new_tab(
     result = driver.newtab(
         url, client_id=client_id, timeout=timeout, active=active
     )
+    if isinstance(result, dict) and result.get("client_id") is not None:
+        client_id = str(result["client_id"])
     info = _extension_data(result)
     if info.get("ok") is True and isinstance(info.get("data"), dict):
         info = dict(info["data"])
@@ -1226,8 +1472,10 @@ def open_new_tab(
     expected_sid = f"{client_id}:{tab_id}" if client_id else None
     found_sid: Optional[str] = None
     found_url = str(info.get("url") or url)
-    while time.monotonic() < deadline:
-        remaining = max(0.1, deadline - time.monotonic())
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         try:
             sessions = active_sessions(timeout=min(2.0, remaining), fresh=True)
         except Exception:
@@ -1255,8 +1503,24 @@ def open_new_tab(
             found_sid = str(match.get("id"))
             found_url = str(match.get("url") or found_url)
             break
-        time.sleep(0.1)
-    ready = bool(found_sid and info.get("load_ready", True))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.1, remaining))
+    # Exact session+generation registration is the readiness barrier for
+    # session-scoped tools.  The extension now acknowledges chrome.tabs.create
+    # immediately, so its initial tab.status is commonly "loading"; retaining
+    # that snapshot as a second gate would leave a permanently pending result
+    # even after the content session has registered and is executable.
+    ready = bool(found_sid)
+    ownership: Optional[dict[str, str]] = None
+    ownership_sid = found_sid or expected_sid
+    if ownership_sid and generation is not None:
+        ownership = _TAB_OWNERSHIP.register(
+            ownership_sid,
+            generation,
+            owner_id=owner_id,
+        )
     out: dict[str, Any] = {
         "status": "ok" if ready else "pending",
         "tab_id": tab_id,
@@ -1265,13 +1529,20 @@ def open_new_tab(
         "ready": ready,
         "url": found_url,
         "load_status": info.get("status"),
+        "owned": ownership is not None,
+        "opener": "agent",
+        "owner_id": ownership["owner_id"] if ownership else None,
         "result": result,
-        "tabs": compact_tabs(),
     }
     if not ready:
         out["hint"] = (
             "The native tab exists but its session did not register before the bounded timeout. "
             "Use the returned tab_id with cdp_command, or list_tabs once before session tools."
+        )
+    elif generation is None:
+        out["hint"] = (
+            "The tab is ready, but the loaded extension did not return a lifecycle generation, "
+            "so ABM did not mark it owned. Reload the unpacked extension before relying on safe cleanup."
         )
     return out
 
@@ -1350,6 +1621,202 @@ def _extension_operation_result(
         **context,
         **({"data": payload} if payload not in ({}, None) else {}),
     }
+
+
+def _move_download(
+    source: Path,
+    destination: Path,
+    *,
+    overwrite: bool,
+) -> None:
+    source = source.resolve()
+    destination = destination.resolve()
+    if source == destination:
+        return
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if not overwrite:
+        temporary: Optional[Path] = None
+        try:
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=f".{destination.name}.",
+                suffix=".download",
+                dir=destination.parent,
+            )
+            temporary = Path(temporary_name)
+            with os.fdopen(descriptor, "wb") as temporary_file, source.open(
+                "rb"
+            ) as source_file:
+                shutil.copyfileobj(source_file, temporary_file)
+                temporary_file.flush()
+                os.fsync(temporary_file.fileno())
+            shutil.copystat(source, temporary)
+            os.link(temporary, destination)
+            temporary.unlink()
+            temporary = None
+            source.unlink()
+            return
+        except FileExistsError as exc:
+            raise FileExistsError(
+                f"download destination already exists: {destination}; "
+                "pass overwrite=true to replace it"
+            ) from exc
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+    try:
+        os.replace(source, destination)
+        return
+    except OSError:
+        temporary = destination.with_name(
+            f".{destination.name}.{os.getpid()}.{threading.get_ident()}.download"
+        )
+        try:
+            shutil.copy2(source, temporary)
+            os.replace(temporary, destination)
+            source.unlink()
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+@mcp.tool(
+    description=(
+        "Download an http(s) URL through the real browser's native download manager, so "
+        "the current browser profile's cookies and authenticated session are used. Waits "
+        "for completion by default and returns the final absolute local path. directory may "
+        "be any absolute local directory; completed files are moved there without replacing an "
+        "existing file unless overwrite=true. A directory timeout reports directory_applied=false "
+        "because Chrome may finish in its default download directory. An explicit session_id "
+        "must still be live and is never replaced with another profile. Use this for attachments "
+        "instead of page fetch."
+    ),
+    serialize=False,
+)
+def download_file(
+    url: str,
+    filename: Optional[str] = None,
+    directory: Optional[str] = None,
+    wait: bool = True,
+    timeout: float = 60.0,
+    session_id: Optional[str] = None,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    parsed = urlsplit(str(url).strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("url must be an absolute http(s) URL")
+    timeout = float(timeout)
+    if not 0 < timeout <= 1800:
+        raise ValueError("timeout must be between 0 and 1800 seconds")
+
+    relative_name: Optional[Path] = None
+    if filename is not None:
+        filename = str(filename).strip()
+        relative_name = Path(filename)
+        if (not filename or not relative_name.parts or relative_name.anchor
+                or relative_name.is_absolute()
+                or ".." in relative_name.parts):
+            raise ValueError(
+                "filename must be a non-empty relative download name without '..'"
+            )
+
+    target_directory: Optional[Path] = None
+    if directory is not None:
+        target_directory = Path(str(directory)).expanduser()
+        if not target_directory.is_absolute():
+            raise ValueError("directory must be an absolute path")
+        target_directory = target_directory.resolve()
+        if not wait:
+            raise ValueError("directory requires wait=true")
+
+    client_id: Optional[str] = None
+    if session_id is not None:
+        explicit_session_id = str(session_id)
+        client_id, _ = _split_session_target(explicit_session_id)
+        sessions = active_sessions(fresh=True)
+        if not any(str(item.get("id")) == explicit_session_id for item in sessions):
+            raise RuntimeError(f"Session {explicit_session_id} not found")
+    else:
+        # Pin the implicit browser while other serialized tools have their
+        # temporary default-session mutations restored. Release immediately:
+        # the potentially long native download wait must not block other tools.
+        with _TOOL_LOCK:
+            client_id = _implicit_client_id()
+
+    payload: dict[str, Any] = {
+        "cmd": "downloads",
+        "method": "download",
+        "url": parsed.geturl(),
+        "conflictAction": "overwrite" if overwrite else "uniquify",
+        "wait": bool(wait),
+        "timeoutMs": max(1, int(timeout * 1000)),
+    }
+    if filename is not None:
+        payload["filename"] = filename.replace("\\", "/")
+    response = require_driver().ext_cmd(
+        payload,
+        client_id=client_id,
+        timeout=timeout + 1.0,
+    )
+    result = _extension_data(response)
+    if result.get("ok") is False:
+        return {
+            "type": "download",
+            "status": "failed",
+            **({"download_id": result["download_id"]} if result.get("download_id") is not None else {}),
+            "error": result.get("error") or "download failed",
+            **({"code": result["code"]} if result.get("code") else {}),
+        }
+    info = result.get("data") if result.get("ok") is True else result
+    if not isinstance(info, dict):
+        raise RuntimeError("download_file received an invalid extension response")
+    status = str(info.get("status") or "failed")
+    out: dict[str, Any] = {
+        "type": "download",
+        "status": status,
+        **({"download_id": info["download_id"]} if info.get("download_id") is not None else {}),
+        **({"bytes_received": info["bytes_received"]} if info.get("bytes_received") is not None else {}),
+        **({"total_bytes": info["total_bytes"]} if info.get("total_bytes") is not None else {}),
+    }
+    if status == "failed":
+        out["error"] = info.get("error") or "download interrupted"
+        if info.get("code"):
+            out["code"] = info["code"]
+        if info.get("hint"):
+            out["hint"] = info["hint"]
+        return out
+    if status != "completed":
+        if target_directory is not None:
+            out["directory_applied"] = False
+            out["requested_directory"] = str(target_directory)
+            out["hint"] = (
+                "The requested directory move was not applied because the download did not "
+                "finish before this call returned. The file may continue downloading into "
+                "the browser's default download directory, and this call no longer tracks it."
+            )
+        else:
+            out.setdefault(
+                "hint",
+                "The browser accepted the download but it did not reach a terminal state before this call returned.",
+            )
+        return out
+
+    raw_path = info.get("path")
+    if not isinstance(raw_path, str) or not raw_path:
+        raise RuntimeError("download completed but the browser returned no local path")
+    source = Path(raw_path).expanduser().resolve()
+    if not source.is_file():
+        raise RuntimeError(
+            f"download completed but the reported local file does not exist: {source}"
+        )
+    final_path = source
+    if target_directory is not None:
+        destination_name = relative_name if relative_name is not None else Path(source.name)
+        final_path = (target_directory / destination_name).resolve()
+        if not final_path.is_relative_to(target_directory):
+            raise ValueError("filename must stay within directory")
+        _move_download(source, final_path, overwrite=bool(overwrite))
+    out["path"] = str(final_path)
+    out["size"] = final_path.stat().st_size
+    return out
 
 
 @mcp.tool(

@@ -4,6 +4,8 @@
 
 一个 MCP 服务,让你的 Agent 直接操作**你正在使用的那个真实 Chrome** —— 通过 Chrome 扩展和 CDP 协议接入。Agent 工作在你已有的浏览器会话里,登录态、Cookies、已打开的标签页原本就在,不需要再开一个沙盒浏览器重新登录一遍。
 
+当前版本:Python 包 **0.2.1** + Chrome unpacked 扩展 **2.1.2**。
+
 它也能越过页面层:在操作系统级别发出真实的鼠标和键盘输入,应对页面内 JavaScript 不够用的场景。那五个工具是仅有的会碰你桌面的工具;`safe` 模式逐次批准,本机默认的 `lab` 模式复用本次会话批准,也可显式关闭询问。
 
 ## 核心能力
@@ -17,6 +19,7 @@
 - **显式对话框策略** —— `alert`、`confirm`、`prompt`、`beforeunload` 各自有 `dismiss`/`accept`/`manual` 策略并如实上报;留在原地的对话框用 `handle_dialog` 处理
 - **临时站点权限** —— 给某个 origin 授予 notifications、geolocation、camera 或 microphone 60–600 秒,到期自动恢复原设置
 - **原生 CDP** —— 单条命令或批量,可按标签页、扩展 id、target id 三种方式寻址
+- **登录态原生下载** —— 通过 Chrome 下载管理器和当前浏览器 profile 的 Cookie 下载附件,等待完成并返回已验证的本地路径
 - **零标签页可用** —— 扩展管理、CDP 目标列举、标签页列举与关闭走的是扩展 service worker 通道,标签页全关也能用
 - **截图** —— CDP 页面截图会作为 MCP 图片内容返回,也可同时落盘;另有整屏桌面截图用于核对物理输入。不支持图片的模型必须改用 `scan_page`、页面 API 或 OCR 读取内容
 - **真实物理输入(需逐次批准)** —— 系统级鼠标移动/点击/拖拽、键盘输入、热键,每一次都要先通过一次批准
@@ -145,6 +148,9 @@ mcp_servers:
 | `AGENT_BROWSER_TMWD_HOST` | `127.0.0.1` | 桥的绑定地址 |
 | `AGENT_BROWSER_TMWD_PORT` | `18765` | WebSocket 端口。HTTP 用 `PORT+1`,`PORT+2` 是把关用的锁 socket,保证只有一个桥在托管 |
 | `AGENT_BROWSER_NO_SPAWN` | 未设置 | 设为 `1` 则 MCP 服务不自动拉起桥,适合你自己手动跑桥的场景 |
+| `AGENT_BROWSER_BRIDGE_AUTH` | 启用 | 仅在明确可信的本机兼容环境中设为 `off`。默认 ABM 使用持久用户 token 保护 `/link`。 |
+| `AGENT_BROWSER_BRIDGE_TOKEN_FILE` | `~/.agent-browser-mcp/bridge-token` | 覆盖共享 token 文件位置。各编辑器不需要分别配置 token。 |
+| `AGENT_BROWSER_BRIDGE_TOKEN` | 未设置 | 旧安装的一次性迁移来源。token 文件不存在时导入一次,此后始终以文件为准。 |
 | `AGENT_BROWSER_PREFERRED_BROWSER` | 未设置 | `chrome` / `edge` / `opera`。多个浏览器都连上、又没指定标签页时,默认落在哪个浏览器 |
 | `AGENT_BROWSER_MODE` | `lab` | `lab` 优先连续自动化并复用会话批准;`safe` 对每次物理输入/站点 allow 单独询问。也可用 `set_automation_profile` 只改当前 MCP 进程 |
 | `AGENT_BROWSER_LAB_NO_ELICIT` | 未设置 | `lab` 下设为 `1` 可跳过物理输入与站点 allow 的 elicitation;跨进程锁和安静窗口仍生效 |
@@ -161,6 +167,11 @@ agent-browser-mcp print-hermes-config  # 打印 Hermes 配置片段
 ```
 
 `doctor` 会报告扩展路径、`config.js` 是否生成、端口状态、已连接标签页数量。它还给出一个结构化判定:`cause` 是 `healthy` / `ext_never_registered` / `sw_slept_or_dropped` / `bridge_unreachable` 之一,`advice` 是对应的一句话修复建议 —— 不用再手动 `netstat` 加 `curl` 逐层刨。
+
+ABM 首次使用时创建 `~/.agent-browser-mcp/bridge-token`,桥和所有 MCP 进程都读取
+这一个文件。关闭浏览器或编辑器不会轮换 token。卸载浏览器扩展或重装 Python 包时
+会有意保留该文件,因此重装后可直接继续使用。只有要彻底清除用户数据时,才应先停止
+所有 ABM 桥进程,再删除整个 `~/.agent-browser-mcp` 目录;下次启动会生成新 token。
 
 ## 工作原理
 
@@ -188,6 +199,12 @@ agent-browser-mcp print-hermes-config  # 打印 Hermes 配置片段
 
 **改了工具要重载。** 工具 schema 和描述在客户端启动 MCP server 时读一次;升级后重启 MCP 会话或客户端,否则你调的还是旧签名。扩展改动需要在 `chrome://extensions` 手动 reload —— `chrome.runtime.reload()` 只会重启 service worker,不会从磁盘重新读文件。
 
+### 并行任务的 tab 归属
+
+使用前必须分类。**U(用户 tab)** 是任务首次 `list_tabs` 时已经存在的页面,默认不关闭、不导航。**A(Agent tab)** 是本任务 `open_new_tab` 创建的页面;保存它的 `session_id`、`generation`、`owner_id`,后续每步显式带该 session,并在清理路径调用 `close_tabs(..., owner_id=...)`。**B(借用 tab)** 是临时使用的 U;借用前记录 `original_url`,结束时若仍存在则恢复 URL,绝不关闭。
+
+决策序:先 `list_tabs`;已有匹配页时只有只读/轻操作才借用;导航、表单或其它重状态变更优先开 A;没有匹配页则开 A;最后只关闭 A。禁止把初始快照登记为 owned、关闭 U/B、依赖共享默认 session、复用旧原生 tab id、绕过 generation 清理或泄漏 A。并行任务应各用各的 A,不要争抢同一个 U。
+
 ### 结构化状态
 
 预期内的中断以 `status` 字段返回,而不是抛异常:
@@ -201,6 +218,7 @@ agent-browser-mcp print-hermes-config  # 打印 Hermes 配置片段
 | `blocked_by_beforeunload` | 导航被取消以保住页面;要离开就带 `beforeunload="accept"` 重发 |
 | `dialog_handle_failed` | 看到了对话框但应答失败;标签页可能仍被卡住 |
 | `navigation_failed` / `navigation_timeout` | `open_url` 超时未完成,或浏览器报错 |
+| `triggered` 且 `type="download"` | `open_url` 被浏览器下载取代。只有 CDP 同时报告 `isDownload=true` 时 `ERR_ABORTED` 才可能是正常下载语义;要完成状态和本地路径请用 `download_file` |
 | `requires_user_action` | 批准被拒绝、取消或不可用 —— 什么都没做 |
 | `busy` | 另一个 ABM 进程持有物理输入锁,或标签页已有挂起的 manual 执行。立即返回,绝不排队 |
 | `input_activity_detected` | 批准后的安静窗口里你动了鼠标或键盘,所以没有发出物理输入 |
@@ -219,7 +237,7 @@ agent-browser-mcp print-hermes-config  # 打印 Hermes 配置片段
 - 这**不是**安全边界。参见 [MCP 安全最佳实践](https://modelcontextprotocol.io/docs/tutorials/security/security_best_practices)
 - 不建议把它指向你不希望被 MCP 客户端看到的敏感账号,也不建议在共享机器或生产机器上跑
 
-扩展申请的权限比较宽,因为这些能力确实需要:`cookies`、`tabs`、`activeTab`、`debugger`、`scripting`、`alarms`、`storage`、`contentSettings`、`declarativeNetRequest`、`management`、`bookmarks`,以及 `<all_urls>`。
+扩展申请的权限比较宽,因为这些能力确实需要:`cookies`、`tabs`、`activeTab`、`debugger`、`scripting`、`alarms`、`storage`、`contentSettings`、`declarativeNetRequest`、`management`、`bookmarks`、`downloads`,以及 `<all_urls>`。
 
 ## 工具列表
 
@@ -229,7 +247,8 @@ agent-browser-mcp print-hermes-config  # 打印 Hermes 配置片段
 <summary><b>标签页与导航</b></summary>
 
 - **get_setup_status** —— 扩展路径、端口、已连接标签页、当前会话。无参数
-- **get_automation_profile** / **set_automation_profile** —— 查看或切换当前 MCP 进程的 `lab|safe` profile;切换不会持久化或重载扩展
+- **get_automation_profile** —— 查看当前 MCP 进程使用 `lab` 还是 `safe` profile
+- **set_automation_profile** —— 切换当前 MCP 进程的 `lab|safe` profile;覆盖值不会持久化或重载扩展
 - **list_tabs** —— 列出已连接的标签页,每项带 `browser` 字段。无参数
 - **list_all_tabs** —— *(零标签页可用)* 列出全部标签页,含 `list_tabs` 隐藏的 `chrome-extension://` 页面。这类页面永远不会成为会话,所以没有 session id,要用 `cdp_command(tab_id=...)` 操作
   - `session_id`(string,可选):问哪个浏览器
@@ -237,12 +256,14 @@ agent-browser-mcp print-hermes-config  # 打印 Hermes 配置片段
   - `session_id`(string,可选)、`url_pattern`(string,可选):子串匹配、`browser`(string,可选):`chrome` / `edge` / `opera`、`activate`(boolean,可选):默认 `false`
 - **activate_tab** —— 把标签页提到前台并聚焦其窗口。这是显式提前台的方式,也是唯一不需要批准物理输入的方式。看返回里的 `on_screen`:Windows 上最小化的窗口不一定提得起来,`false` 意味着屏幕坐标点击会打偏
   - `session_id`(string,可选)
-- **open_url** —— 当前标签页导航到 URL,并报告**实际落地**的地址。全局默认仍是 `dismiss`;lab 命中配置的 shell/IDE host 时自动 accept。协议 `navigate` 在重 SPA 失效时自动降级 `Page.navigate`
+- **open_url** —— 当前标签页导航到 URL,并报告**实际落地**的地址。全局默认仍是 `dismiss`;lab 命中配置的 shell/IDE host 时自动 accept。协议 `navigate` 在重 SPA 失效时自动降级 `Page.navigate`。CDP 返回 `isDownload=true` 时改为返回 `{type:"download",status:"triggered"}`,不再只报 `navigation_failed`;此时附带的 `ERR_ABORTED` 是正常下载导航语义
   - `url`(string)、`session_id`(string,可选)、`timeout`(number,可选)、`beforeunload`(string,可选)、`intent_leave`(boolean,可选):`false` 强制保留页面
-- **open_new_tab** —— 新开标签页并等待 load/session 注册,返回 `{tab_id,session_id,generation,ready,load_status}`;生命周期 `generation` 可防止复用的原生 tab id 误匹配旧注册,返回 `ready=true` 后可立即操作
-  - `url`(string)、`timeout`(number,可选)、`active`(boolean,可选)
-- **close_tabs** —— *(零标签页可用)* 接受原生数字 tab id 或完整 `client:tabId` session id;对 `chrome-extension://` 页面也有效
-  - `tab_id`(integer/string 或数组)、`session_id`(string,可选)
+- **download_file** —— 通过 Chrome 原生下载管理器下载 HTTP(S) URL,使用该浏览器 profile 的 Cookie 和登录态。默认等待完成,返回 `status="completed"` 和已验证的绝对 `path`;中断返回 `failed`,超时或 `wait=false` 返回带 `download_id` 的 `in_progress`。显式 `session_id` 必须仍存活,不会静默改用其它 profile。附件应使用本工具,不要在页面里 `fetch`
+  - `url`(string)、`filename`(string,可选):相对下载名称、`directory`(string,可选):任意绝对目标目录并自动建父目录;要求 `wait=true`、`wait`(boolean,可选):默认 `true`、`timeout`(number,可选):默认 60 秒,最大 1800、`session_id`(string,可选):选择浏览器 profile、`overwrite`(boolean,可选):默认 `false`,最终目标已存在时拒绝,只有显式 `true` 才替换。带 `directory` 的调用若超时会返回 `directory_applied=false`:后续搬移不再受跟踪,Chrome 可能继续下载到浏览器默认目录
+- **open_new_tab** —— 新开标签页并有界等待精确 session/generation 注册,返回 `{tab_id,session_id,generation,ready,owned,opener,owner_id,load_status}`;create ACK 一旦给出 `tab_id+generation` 就登记 owned,即使 `ready=false`;`ready` 只表示 session 工具能否立即使用。保存随机 `owner_id` capability,只用于该任务收尾
+  - `url`(string)、`timeout`(number,可选)、`active`(boolean,可选)、`session_id`(string,可选):选择浏览器/profile、`owner_id`(string,可选):让同一任务的多个新 tab 共用一个 owner
+- **close_tabs** —— *(零标签页可用)* 接受原生数字 tab id 或完整 `client:tabId` session id;对 `chrome-extension://` 页面也有效。默认 `only_if_agent_owned=true`,必须传 `open_new_tab` 返回的 `owner_id`,并在关闭前核对当前 lifecycle generation;用户预存 tab、其它 Agent 的 tab、复用 id 的新生命周期都会拒绝。若用户已手动关掉 owned tab,收尾返回 `status=already_gone, closed_by=user`,不会拿旧原生 id 补关;真正关闭 owned tab 才返回 `closed_by=agent`;显式关闭非 owned/U 的 operator override 返回 `closed_by=none`,不会计入本任务 owned 清理。仅当用户明确要求关闭非 owned/U tab 时才设 `only_if_agent_owned=false`
+  - `tab_id`(integer/string 或数组)、`session_id`(string,可选)、`owner_id`(string,安全默认下必填)、`only_if_agent_owned`(boolean,默认 `true`)
 </details>
 
 <details>
@@ -328,15 +349,20 @@ agent-browser-mcp print-hermes-config  # 打印 Hermes 配置片段
 - **set_extension_enabled** —— *(零标签页可用)* 启用或禁用已安装的扩展。Chrome 没有任何 API 可以*安装*扩展,所以这里只能开关已存在的
   - `extension_id`(string)、`enabled`(boolean)、`session_id`(string,可选)
 - **uninstall_extension** —— *(零标签页可用)* 卸载另一个扩展;默认显示 Chrome 确认框,仅明确选择的测试扩展才设 `show_confirm_dialog=false`;不能通过活动通道卸载 ABM 自身
-- **get_bookmarks** / **create_bookmark** / **remove_bookmark** —— *(零标签页可用)* 读取书签树、创建书签/文件夹、删除书签或递归删除文件夹
+- **get_bookmarks** —— *(零标签页可用)* 读取书签树
+- **create_bookmark** —— *(零标签页可用)* 创建书签或文件夹
+- **remove_bookmark** —— *(零标签页可用)* 删除书签或递归删除文件夹
 - **call_extension** —— *(零标签页可用)* 向另一个扩展发送 JSON;目标必须启用并通过 `externally_connectable` 允许 ABM
 </details>
 
 <details>
 <summary><b>Network 与 Console 捕获</b></summary>
 
-- **network_capture_start** / **network_capture_stop** —— 在指定 tab 上持续收集请求/响应和可选 body。默认 500 条环形缓冲、单 body 256 KiB;始终在 `finally` 语义下调用 stop 释放 debugger lease
-- **console_capture_start** / **get_console_messages** / **console_capture_stop** —— 收集 `console.*` 与未捕获异常;get 支持 `offset`/`max_items`/`clear`,stop 返回剩余消息并释放 lease
+- **network_capture_start** —— 在指定 tab 上开始收集请求/响应和可选 body;默认 500 条环形缓冲、单 body 256 KiB
+- **network_capture_stop** —— 返回当前 Network 捕获并释放 debugger lease;始终在 `finally` 语义下调用
+- **console_capture_start** —— 开始收集 `console.*` 与未捕获异常
+- **get_console_messages** —— 用 `offset`/`max_items` 分页读取或清空当前 console buffer
+- **console_capture_stop** —— 返回剩余 console 消息并释放 debugger lease
 </details>
 
 <details>

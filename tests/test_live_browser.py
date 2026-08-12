@@ -410,7 +410,7 @@ class TestNewTabGeneration:
             assert "abm-generation=211" in immediate["js_return"]
         finally:
             if created_sid:
-                S.close_tabs(created_sid)
+                S.close_tabs(created_sid, owner_id=created.get("owner_id"))
 
 
 class TestBackgroundPageInput:

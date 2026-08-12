@@ -23,6 +23,7 @@ EXPECTED = {
     # extensions
     "list_extensions", "set_extension_enabled", "uninstall_extension",
     "get_bookmarks", "create_bookmark", "remove_bookmark", "call_extension",
+    "download_file",
     "network_capture_start", "network_capture_stop", "console_capture_start",
     "get_console_messages", "console_capture_stop",
     "save_pdf",
@@ -164,6 +165,13 @@ class TestNewToolSchemas:
         assert "session_id" in by_name["resolve_leave_dialog"].inputSchema["properties"]
         assert "ctx" not in by_name["resolve_leave_dialog"].inputSchema["properties"]
 
+    def test_tab_ownership_params_are_exposed_with_safe_close_default(self, by_name):
+        opened = by_name["open_new_tab"].inputSchema["properties"]
+        closed = by_name["close_tabs"].inputSchema["properties"]
+        assert "owner_id" in opened
+        assert {"owner_id", "only_if_agent_owned"} <= set(closed)
+        assert closed["only_if_agent_owned"]["default"] is True
+
     def test_extension_and_bookmark_params(self, by_name):
         assert {"extension_id", "show_confirm_dialog", "session_id"} <= set(
             by_name["uninstall_extension"].inputSchema["properties"]
@@ -177,6 +185,10 @@ class TestNewToolSchemas:
         assert {"extension_id", "message_json", "session_id"} <= set(
             by_name["call_extension"].inputSchema["properties"]
         )
+        assert {"url", "filename", "directory", "wait", "timeout", "session_id", "overwrite"} <= set(
+            by_name["download_file"].inputSchema["properties"]
+        )
+        assert by_name["download_file"].inputSchema["properties"]["overwrite"]["default"] is False
 
     def test_capture_params(self, by_name):
         assert {

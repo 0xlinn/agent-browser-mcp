@@ -1,4 +1,5 @@
-import json, os, threading, time, uuid, queue, socket, requests, traceback, hmac
+import json, os, threading, time, uuid, queue, socket, requests, traceback, hmac, secrets
+from pathlib import Path
 from typing import Dict, Any, Optional, List
 from simple_websocket_server import WebSocketServer, WebSocket
 from bs4 import BeautifulSoup
@@ -8,13 +9,70 @@ from bottle import route, template, request, response
 # --- /link 鉴权 --------------------------------------------------------------
 # WS 口靠 origin 前缀挡住网页（扩展读不到磁盘上的密钥，只能这么做）；但 /link 是
 # 命令通道，本机任意进程都能 POST 一条 execute_js 在用户登录态的 Chrome 里跑任意
-# JS。设了这个环境变量才强制校验：没设保持原样，否则旧客户端/旧扩展会全断。
+# JS。ABM 默认用用户目录中的持久 token 鉴权；旧环境变量只用于一次迁移。
 TOKEN_ENV = 'AGENT_BROWSER_BRIDGE_TOKEN'
+TOKEN_FILE_ENV = 'AGENT_BROWSER_BRIDGE_TOKEN_FILE'
+TOKEN_AUTH_ENV = 'AGENT_BROWSER_BRIDGE_AUTH'
+
+
+def bridge_token_path() -> Path:
+    """Return the one persistent token location shared by all ABM processes."""
+    configured = (os.environ.get(TOKEN_FILE_ENV) or '').strip()
+    return Path(configured).expanduser() if configured else Path.home() / '.agent-browser-mcp' / 'bridge-token'
+
+
+def _read_token_file(path: Path) -> str:
+    try:
+        value = path.read_text(encoding='utf-8').strip()
+    except (OSError, UnicodeError):
+        return ''
+    return value
+
+
+def _persist_token(path: Path, token: str) -> str:
+    """Create the token file once; concurrent starters converge on its value."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        try:
+            os.write(fd, (token + '\n').encode('utf-8'))
+        finally:
+            os.close(fd)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        return token
+    except FileExistsError:
+        # O_EXCL exposes the file just before the winning process writes its
+        # contents. Give that tiny window time to close instead of inventing a
+        # different in-memory token that would immediately split the clients.
+        for _ in range(20):
+            stored = _read_token_file(path)
+            if stored:
+                return stored
+            time.sleep(0.01)
+        raise RuntimeError(f'ABM bridge token file is empty: {path}')
+    except OSError as exc:
+        raise RuntimeError(f'ABM cannot persist its bridge token at {path}: {exc}') from exc
 
 
 def bridge_token() -> str:
-    """共享密钥，每次请求现读 —— 守护进程从父进程继承 env，测试也好改。"""
-    return (os.environ.get(TOKEN_ENV) or '').strip()
+    """Read or create the stable per-user token shared by every ABM process.
+
+    The old env var is a one-time bootstrap for existing installs. Once the file
+    exists, later editor environments cannot rotate or replace it. Authentication
+    can only be disabled deliberately via ``AGENT_BROWSER_BRIDGE_AUTH=off``.
+    """
+    auth_mode = (os.environ.get(TOKEN_AUTH_ENV) or '').strip().lower()
+    if auth_mode in {'0', 'false', 'off', 'disabled'}:
+        return ''
+    path = bridge_token_path()
+    stored = _read_token_file(path)
+    if stored:
+        return stored
+    legacy = (os.environ.get(TOKEN_ENV) or '').strip()
+    return _persist_token(path, legacy or secrets.token_urlsafe(32))
 
 
 def header_token(headers) -> str:
@@ -30,7 +88,7 @@ def header_token(headers) -> str:
 
 
 def check_link_token(headers, want: str) -> None:
-    """token 不对就抛 401。want 为空表示没配置 token，直接放行（向后兼容）。"""
+    """token 不对就抛 401。want 为空仅表示鉴权被显式关闭。"""
     if not want:
         return
     got = header_token(headers)
@@ -40,7 +98,7 @@ def check_link_token(headers, want: str) -> None:
             status=401, body='unauthorized: missing or bad bridge token')
 
 
-# 单参数版：want 从 env 现读。测试与外部调用方按此名引用；桥内部用
+# 单参数版：want 从共享文件现读。测试与外部调用方按此名引用；桥内部用
 # check_link_token(headers, want) 传已锁定的 token。
 def require_link_token(headers) -> None:
     check_link_token(headers, bridge_token())
@@ -135,11 +193,11 @@ class TMWebDriver:
 
     def start_http_server(self):
         self.app = app = bottle.Bottle()
-        # 启动时锁定一次，之后不再读 env。桥是常驻守护进程，token 只能来自拉起它的
-        # 那个环境；每请求现读还会让同进程里改 env 的调用方意外改变鉴权规则。
+        # 启动时锁定一次。所有进程从同一个持久文件取 token；运行期间若有人做完整
+        # 用户数据清理，旧 daemon 仍保持原值，必须在清理前先停止它。
         self.link_token = bridge_token()
         if self.link_token:
-            print(f"/link 已启用 token 鉴权（{TOKEN_ENV}）")
+            print(f"/link 已启用 token 鉴权（{bridge_token_path()}）")
 
         @app.hook('before_request')
         def _reject_cross_origin():
@@ -162,7 +220,7 @@ class TMWebDriver:
         def long_poll():
             # 结果回传通道与 /link 同源：token 已配置时必须同样鉴权，否则本机
             # 任意进程可在无 Origin 头的情况下注册伪造会话（本地纵深防御）。
-            # 未配置 token 时保持向后兼容（旧版 userscript 轮询客户端）。
+            # 显式关闭鉴权时保持旧版 userscript 轮询客户端兼容。
             check_link_token(request.headers, self.link_token)
             data = request.json
             session_id = data.get('sessionId')  
@@ -199,7 +257,7 @@ class TMWebDriver:
 
         @app.route('/link', method=['GET','POST'])
         def link():
-            # 命令通道，先鉴权再解析 body：未配置 token 时是 no-op。
+            # 命令通道，先鉴权再解析 body；仅显式关闭鉴权时是 no-op。
             check_link_token(request.headers, self.link_token)
             data = request.json
             if not isinstance(data, dict):
@@ -801,11 +859,12 @@ class TMWebDriver:
         assert result is not missing_result
         self.acks.pop(exec_id, None)
         if not result['success']: raise Exception(result['data'])
-        return {'data': result['data']}
+        return {'data': result['data'], 'client_id': client_id}
 
     def _remote_cmd(self, cmd, timeout=30):
         headers = {"Content-Type": "application/json"}
-        # 现读而不是构造时缓存：桥和客户端都从同一个 env 取，进程内改了也生效。
+        # Every client reads the same persistent per-user token file. This is
+        # independent of which editor launched the MCP process.
         token = bridge_token()
         if token:
             headers["Authorization"] = f"Bearer {token}"
@@ -814,8 +873,9 @@ class TMWebDriver:
         if resp.status_code == 401:
             # 别把 401 的 HTML/文本喂给 .json()（会变成一句看不懂的 JSONDecodeError）。
             raise PermissionError(
-                f"桥拒绝了本次请求(401)：{TOKEN_ENV} 未设置或与桥进程的不一致。"
-                f"给 MCP server 和桥守护进程配同一个 {TOKEN_ENV} 后重启桥。")
+                "桥拒绝了本次请求(401)：MCP 与常驻桥读取的 ABM token 不一致。"
+                f"确认双方使用同一个 {bridge_token_path()}，然后重启旧桥；"
+                f"{TOKEN_ENV} 仅用于旧安装的一次迁移。")
         if resp.status_code >= 400:
             # 桥端未捕获的异常会变成 500 HTML 页；同样不能喂给 .json()，
             # 否则调用方看到的是 JSONDecodeError 而不是真实成因。
@@ -912,7 +972,6 @@ class TMWebDriver:
             "method": "create",
             "url": url,
             "active": bool(active),
-            "timeoutMs": max(1, int(float(timeout) * 1000)),
         }
         try:
             return self.ext_cmd(payload, client_id=client_id, timeout=timeout)

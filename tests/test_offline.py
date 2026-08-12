@@ -167,7 +167,7 @@ EXPECTED_TOOLS = {
     "switch_tab", "activate_tab", "open_url", "open_new_tab",
     "extension_path", "list_extensions", "set_extension_enabled",
     "uninstall_extension", "get_bookmarks", "create_bookmark",
-    "remove_bookmark", "call_extension",
+    "remove_bookmark", "call_extension", "download_file",
     "network_capture_start", "network_capture_stop", "console_capture_start",
     "get_console_messages", "console_capture_stop",
     "save_pdf",
@@ -358,11 +358,7 @@ def test_driver_ack_does_not_restart_execute_js_deadline():
     class Socket:
         def send_message(self, payload):
             exec_id = json.loads(payload)["id"]
-            timer = threading.Timer(
-                0.08, lambda: driver.acks.__setitem__(exec_id, time.time())
-            )
-            timer.daemon = True
-            timer.start()
+            driver.acks[exec_id] = time.time()
 
     session = Session(
         "c:1",
@@ -441,9 +437,27 @@ def test_ext_cmd_consumes_result_arriving_in_final_poll_slice(monkeypatch):
 
     monkeypatch.setattr("agent_browser_mcp.tmwebdriver.time.sleep", final_sleep)
 
-    result = driver.ext_cmd({"cmd": "tabs"}, client_id="c", timeout=0.05)
+    result = driver.ext_cmd({"cmd": "tabs"}, timeout=0.05)
 
-    assert result == {"data": {"ok": True}}
+    assert result == {"data": {"ok": True}, "client_id": "c"}
+
+
+def test_remote_ext_cmd_preserves_bridge_selected_client_id(monkeypatch):
+    driver = TMWebDriver.__new__(TMWebDriver)
+    driver.is_remote = True
+    driver.default_session_id = None
+    seen = {}
+
+    def remote(payload, timeout=30):
+        seen["payload"] = payload
+        return {"r": {"data": {"id": 9}, "client_id": "chrome:profile"}}
+
+    monkeypatch.setattr(driver, "_remote_cmd", remote)
+
+    result = driver.ext_cmd({"cmd": "tabs", "method": "create"}, timeout=0.1)
+
+    assert seen["payload"]["clientId"] is None
+    assert result == {"data": {"id": 9}, "client_id": "chrome:profile"}
 
 
 def test_page_type_missing_target_sends_no_text_or_key(monkeypatch):

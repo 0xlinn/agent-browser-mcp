@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-browser-mcp"
-version = "0.2.0"
+version = "0.2.1"
 description = "Real-browser MCP server with TMWebDriver/CDP bridge, screenshots, cookies, and physical input"
 readme = "README.md"
 requires-python = ">=3.10"

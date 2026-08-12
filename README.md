@@ -6,6 +6,8 @@ English | [中文文档](README.zh-CN.md)
 
 A Model Context Protocol (MCP) server that drives **the real Chrome you are already using**, through a Chrome extension and the Chrome DevTools Protocol. Your agent works inside your existing browser session, so logins, cookies, and open tabs are all already there — no separate sandbox browser to authenticate again.
 
+Current release: Python package **0.2.1** + unpacked Chrome extension **2.1.2**.
+
 It also reaches past the page: real mouse and keyboard input at the OS level, for cases where page-level JavaScript is not enough. Those five tools are the only ones that touch your desktop: `safe` asks on every call, while the default `lab` profile reuses session approval and can explicitly disable prompts.
 
 ## Key features
@@ -19,8 +21,9 @@ It also reaches past the page: real mouse and keyboard input at the OS level, fo
 - **Explicit dialog policies** — `alert`, `confirm`, `prompt`, and `beforeunload` each get a per-call `dismiss`/`accept`/`manual` policy and are reported truthfully; `handle_dialog` resolves one that is left open.
 - **Temporary site permissions** — grant notifications, geolocation, camera, or microphone to one origin for 60–600 seconds; the prior setting is restored automatically.
 - **Native CDP access** — single commands or batches. Addressable by tab, extension id, or target id.
+- **Authenticated native downloads** — download attachments through Chrome's download manager with the active browser profile's cookies, wait for completion, and receive the verified local path.
 - **Tab-less operation** — extension management, CDP target listing, and tab listing/closing go straight to the extension's service worker, so they work even with zero tabs open.
-- **Screenshots** — page capture via CDP is returned as MCP image content and can also be saved to disk; full desktop capture is available for physical-input checks. A model without image support must use `scan_page`, page APIs, or OCR to inspect content.
+- Page **screenshots** — page capture via CDP is returned as MCP image content and can also be saved to disk; full desktop capture is available for physical-input checks. A model without image support must use `scan_page`, page APIs, or OCR to inspect content.
 - **Real physical input, behind approval** — OS-level mouse move/click/drag, typing, and hotkeys, each requiring one accepted approval prompt for that exact call.
 - **Multi-browser** — Chrome, Edge, and Opera can all connect to one bridge at the same time without clobbering each other's sessions.
 
@@ -147,6 +150,9 @@ If tabs come back empty, run `agent-browser-mcp doctor`.
 | `AGENT_BROWSER_TMWD_HOST` | `127.0.0.1` | Bridge bind address. |
 | `AGENT_BROWSER_TMWD_PORT` | `18765` | WebSocket port. HTTP uses `PORT+1`, and `PORT+2` is a lock socket that keeps exactly one bridge hosting. |
 | `AGENT_BROWSER_NO_SPAWN` | unset | Set to `1` to stop the MCP server from auto-starting the bridge. Use it when you run the bridge yourself. |
+| `AGENT_BROWSER_BRIDGE_AUTH` | enabled | Set to `off` only for an explicitly trusted local compatibility setup. By default ABM authenticates `/link` with a persistent per-user token. |
+| `AGENT_BROWSER_BRIDGE_TOKEN_FILE` | `~/.agent-browser-mcp/bridge-token` | Override the shared token file location. Editors do not need individual token configuration. |
+| `AGENT_BROWSER_BRIDGE_TOKEN` | unset | Legacy one-time migration source. If the token file does not exist, ABM imports this value once; the file wins thereafter. |
 | `AGENT_BROWSER_PREFERRED_BROWSER` | unset | `chrome`, `edge`, or `opera`. Which browser wins when several are connected and no tab is specified. |
 | `AGENT_BROWSER_MODE` | `lab` | `lab` prioritizes continuous automation and reuses session approvals; `safe` prompts for every physical-input/site-allow action. `set_automation_profile` changes only the current MCP process. |
 | `AGENT_BROWSER_LAB_NO_ELICIT` | unset | Set to `1` to skip physical-input and site-allow elicitation in lab. The cross-process lock and quiet-input gate still apply. |
@@ -163,6 +169,13 @@ agent-browser-mcp print-hermes-config  # print a Hermes config snippet
 ```
 
 `doctor` reports the extension path, whether `config.js` was generated, port state, and connected tab count. It also returns a structured verdict: `cause` is one of `healthy`, `ext_never_registered`, `sw_slept_or_dropped`, or `bridge_unreachable`, and `advice` is the matching one-line fix — no manual `netstat` and `curl` archaeology.
+
+ABM creates `~/.agent-browser-mcp/bridge-token` on first use and every bridge/MCP
+process reads that same file. Closing browsers or editors does not rotate it. Removing
+the browser extension or reinstalling the Python package deliberately leaves the token
+file in place, so a reinstall continues to work. A full user-data purge may delete the
+whole `~/.agent-browser-mcp` directory only after all ABM bridge processes have stopped;
+the next start then creates a new token.
 
 ## How it works
 
@@ -190,6 +203,12 @@ Two channels reach the browser: a per-tab session channel, and a direct channel 
 
 **Changed tools need a reload.** Tool schemas and descriptions are read once when your client starts the MCP server; after upgrading, restart the MCP session or your client, or you will keep calling the old signatures. Extension changes need a manual reload at `chrome://extensions` — `chrome.runtime.reload()` restarts the service worker without re-reading the files from disk.
 
+### Tab ownership in concurrent tasks
+
+Classify every tab before using it. A **U (user) tab** existed in the first `list_tabs` snapshot; do not close it or navigate it by default. An **A (agent) tab** is created by this task's `open_new_tab`; save its `session_id`, `generation`, and `owner_id`, pass that explicit session to every operation, and call `close_tabs(..., owner_id=...)` in cleanup. A **B (borrowed) tab** is a temporarily used U tab; record its `original_url`, restore that URL when the tab still exists, and never close it.
+
+Decision order: run `list_tabs`; borrow an existing match only for read-only/light work; open an A tab for navigation, forms, or other state changes; open an A tab when no match exists; finally close only A tabs. Never register the initial tab snapshot as owned, close a U/B tab, depend on the shared default session, reuse an old native tab id, omit generation-aware cleanup, or leak an A tab. Separate concurrent tasks should use separate A tabs instead of competing for the same U tab.
+
 ### Structured statuses
 
 Expected interruptions come back as a `status` field, not an exception:
@@ -203,6 +222,7 @@ Expected interruptions come back as a `status` field, not an exception:
 | `blocked_by_beforeunload` | Navigation was cancelled to keep the page; re-issue with `beforeunload="accept"` to leave. |
 | `dialog_handle_failed` | A dialog was seen but answering it failed; the tab may still be blocked. |
 | `navigation_failed` / `navigation_timeout` | `open_url` did not complete within its timeout, or the browser reported an error. |
+| `triggered` with `type="download"` | `open_url` was replaced by a browser download. `ERR_ABORTED` can be normal only when CDP also reports `isDownload=true`; use `download_file` for completion and the local path. |
 | `requires_user_action` | Approval was declined, cancelled, or unavailable — nothing was done. |
 | `busy` | Another ABM process holds the physical-input lock, or the tab already has a pending manual execution. Returned immediately, never queued. |
 | `input_activity_detected` | You used the mouse or keyboard during the post-approval quiet window, so no physical input was sent. |
@@ -221,7 +241,7 @@ This server drives your real browser and your real desktop. Anything it can do, 
 - This is **not** a security boundary. See [MCP Security Best Practices](https://modelcontextprotocol.io/docs/tutorials/security/security_best_practices).
 - Avoid pointing it at sensitive accounts you would not want an MCP client to see, and prefer not to run it on shared or production machines.
 
-The extension requests broad permissions because the feature set requires them: `cookies`, `tabs`, `activeTab`, `debugger`, `scripting`, `alarms`, `storage`, `contentSettings`, `declarativeNetRequest`, `management`, `bookmarks`, and `<all_urls>`.
+The extension requests broad permissions because the feature set requires them: `cookies`, `tabs`, `activeTab`, `debugger`, `scripting`, `alarms`, `storage`, `contentSettings`, `declarativeNetRequest`, `management`, `bookmarks`, `downloads`, and `<all_urls>`.
 
 ## Tools
 
@@ -231,7 +251,8 @@ Most tools accept an optional `session_id` to target one specific tab; omitting 
 <summary><b>Tabs and navigation</b></summary>
 
 - **get_setup_status** — extension path, ports, connected tabs, and the active session. No parameters.
-- **get_automation_profile** / **set_automation_profile** — inspect or switch the current MCP process between `lab|safe`; switching is not persisted and does not reload the extension.
+- **get_automation_profile** — inspect whether the current MCP process uses `lab` or `safe`.
+- **set_automation_profile** — switch the current MCP process between `lab|safe`; the override is not persisted and does not reload the extension.
 - **list_tabs** — list connected tabs. Each carries a `browser` field. No parameters.
 - **list_all_tabs** — *(no tab needed)* list every open tab, including `chrome-extension://` pages that `list_tabs` hides. Those never become sessions, so they have no session id; drive them with `cdp_command(tab_id=...)`.
   - `session_id` (string, optional): which browser to ask.
@@ -239,11 +260,14 @@ Most tools accept an optional `session_id` to target one specific tab; omitting 
   - `session_id` (string, optional), `url_pattern` (string, optional): substring match, `browser` (string, optional): `chrome`, `edge`, or `opera`, `activate` (boolean, optional): default `false`.
 - **activate_tab** — bring a tab to the foreground and focus its window. This is the explicit way to raise a tab, and the only one that does not involve approving physical input. Check `on_screen` in the reply: on Windows a minimised window cannot always be raised, and `false` means screen-coordinate clicks will miss.
   - `session_id` (string, optional)
-- **open_url** — navigate the current tab. Global behavior remains `dismiss`; lab automatically accepts beforeunload on configured shell/IDE hosts. If the extension's `navigate` route is unavailable on a heavy SPA, ABM falls back to `Page.navigate`.
+- **open_url** — navigate the current tab. Global behavior remains `dismiss`; lab automatically accepts beforeunload on configured shell/IDE hosts. If the extension's `navigate` route is unavailable on a heavy SPA, ABM falls back to `Page.navigate`. A CDP result with `isDownload=true` returns `{type:"download",status:"triggered"}` instead of only `navigation_failed`; the accompanying `ERR_ABORTED` is normal for that download navigation.
   - `url`, `session_id`, `timeout`, `beforeunload`, `intent_leave` (boolean, optional): `false` forces page preservation
-- **open_new_tab** — open a tab and wait for load/session registration; returns `{tab_id,session_id,generation,ready,load_status}`. The lifecycle `generation` prevents a reused native tab id from matching an older registration, so `ready=true` is immediately usable.
-  - `url`, `timeout`, `active`
-- **close_tabs** — *(no tab needed)* accept native numeric tab ids or full `client:tabId` session ids, including `chrome-extension://` tabs.
+- **download_file** — download an HTTP(S) URL through Chrome's native download manager, using that browser profile's cookies and authenticated session. It waits by default and returns `status="completed"` plus a verified absolute `path`; interrupted downloads return `failed`, while a timeout or `wait=false` returns `in_progress` with `download_id`. An explicit `session_id` must still be live and is never replaced with another profile. Use this for attachments instead of page `fetch`.
+  - `url` (string), `filename` (string, optional): relative download name, `directory` (string, optional): arbitrary absolute destination directory; creates parents, `wait` (boolean, optional): default `true`; `directory` requires `true`, `timeout` (number, optional): default 60 seconds, maximum 1800, `session_id` (string, optional): selects the browser profile, `overwrite` (boolean, optional): default `false`; an existing final destination raises an error unless explicitly `true`. If a directory download times out, `directory_applied=false`: the move is no longer tracked and Chrome may finish into its default download directory.
+- **open_new_tab** — open a tab and wait a bounded time for exact session/generation registration; returns `{tab_id,session_id,generation,ready,owned,opener,owner_id,load_status}`. Ownership is registered as soon as the create acknowledgement provides `tab_id+generation`, even when `ready=false`; `ready` only says whether session-scoped tools can be used immediately. Keep its random `owner_id` capability and use it only for that task's cleanup.
+  - `url`, `timeout`, `active`, `session_id` (optional browser/profile selector), `owner_id` (optional capability to group several tabs under one task owner)
+- **close_tabs** — *(no tab needed)* accept native numeric tab ids or full `client:tabId` session ids, including `chrome-extension://` tabs. The default `only_if_agent_owned=true` requires the `owner_id` returned by `open_new_tab` and verifies the current lifecycle generation before closing, so pre-existing user tabs and another agent's tabs are refused. If the user already closed an owned tab, cleanup returns `status=already_gone, closed_by=user` without reusing its native id. An actual owned close returns `closed_by=agent`; an explicit unowned/operator override returns `closed_by=none` so it is not counted as task-owned cleanup. Set `only_if_agent_owned=false` only when the operator explicitly asked to close an unowned/user tab.
+  - `tab_id`, `session_id` (optional browser constraint), `owner_id` (required by the safe default), `only_if_agent_owned` (boolean, default `true`)
 </details>
 
 <details>
@@ -326,15 +350,20 @@ Temporary, origin-scoped permission leases backed by `chrome.contentSettings`. E
 - **set_extension_enabled** — *(no tab needed)* enable or disable an installed extension. Chrome exposes no API to *install* one, so this only toggles what is already there.
   - `extension_id` (string), `enabled` (boolean), `session_id` (string, optional)
 - **uninstall_extension** — *(no tab needed)* uninstall another extension. Confirmation defaults on; set it off only for an explicitly selected disposable/test extension. ABM cannot uninstall itself through its active response channel.
-- **get_bookmarks** / **create_bookmark** / **remove_bookmark** — *(no tab needed)* read the tree, create bookmarks/folders, and remove a bookmark or folder subtree.
+- **get_bookmarks** — *(no tab needed)* read the bookmark tree.
+- **create_bookmark** — *(no tab needed)* create a bookmark or folder.
+- **remove_bookmark** — *(no tab needed)* remove a bookmark or folder subtree.
 - **call_extension** — *(no tab needed)* send JSON to another enabled extension; the target must allow ABM via `externally_connectable`.
 </details>
 
 <details>
 <summary><b>Network and console capture</b></summary>
 
-- **network_capture_start** / **network_capture_stop** — continuously collect bounded request/response records and optional bodies. Defaults: 500-entry ring and 256 KiB per body. Always stop in cleanup so its debugger lease is released.
-- **console_capture_start** / **get_console_messages** / **console_capture_stop** — collect `console.*` and uncaught exceptions; get supports paging/clear, and stop returns the remaining messages and releases the lease.
+- **network_capture_start** — start collecting bounded request/response records and optional bodies. Defaults: 500-entry ring and 256 KiB per body.
+- **network_capture_stop** — return the current capture and release its debugger lease; always call it in cleanup.
+- **console_capture_start** — start collecting `console.*` and uncaught exceptions.
+- **get_console_messages** — page through or clear the current console buffer.
+- **console_capture_stop** — return the remaining console messages and release its debugger lease.
 </details>
 
 <details>

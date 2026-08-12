@@ -192,19 +192,19 @@ def test_open_url_uses_directed_navigate_route_and_preserves_full_session(monkey
 
     assert result["status"] == "blocked_by_beforeunload"
     assert driver.default_session_id == "other:7"
-    assert driver.calls == [
-        (
-            {
-                "cmd": "navigate",
-                "tabId": 42,
-                "url": "https://new.example/",
-                "beforeunload": "dismiss",
-                "timeoutMs": 9000,
-            },
-            "chrome:profile",
-            9.0,
-        )
-    ]
+    assert len(driver.calls) == 1
+    payload, client_id, call_timeout = driver.calls[0]
+    assert payload == {
+        "cmd": "navigate",
+        "tabId": 42,
+        "url": "https://new.example/",
+        "beforeunload": "dismiss",
+        "timeoutMs": payload["timeoutMs"],
+    }
+    assert client_id == "chrome:profile"
+    assert 0 < call_timeout <= 9.0
+    assert 0 < payload["timeoutMs"] <= 9000
+    assert payload["timeoutMs"] <= int(call_timeout * 1000)
 
 
 def test_open_url_rejects_invalid_policy_without_touching_bridge(monkeypatch):
