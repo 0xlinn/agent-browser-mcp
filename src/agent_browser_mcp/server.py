@@ -794,9 +794,15 @@ def close_tabs(
     session_ids = [f"{client_id}:{native_id}" for native_id in native_ids]
     expected_generations: dict[str, str] = {}
     if only_if_agent_owned:
+        capability = str(owner_id).strip() if owner_id is not None else ""
+        if not capability:
+            raise PermissionError(
+                "close_tabs refused: owner_id is required when only_if_agent_owned=true; "
+                "use the capability returned by open_new_tab"
+            )
         expected_generations = _TAB_OWNERSHIP.validate(
             session_ids,
-            owner_id=owner_id,
+            owner_id=capability,
             live_sessions=active_sessions(fresh=True),
         )
     requested: int | list[int] = native_ids[0] if not isinstance(tab_id, list) else native_ids
@@ -1066,12 +1072,60 @@ def open_url(
                 deadline=deadline,
             )
             fallback_used = True
-            result = {
-                "status": "ok",
-                "url": url,
-                "navigation": navigation,
-                "bridge_route_error": str(route_error),
-            }
+            landing: dict[str, Any] = {}
+            landing_error: Optional[str] = None
+            landing_observed = False
+            before_url = str(target_session.get("url") or "")
+            while deadline - time.monotonic() > 0:
+                remaining = deadline - time.monotonic()
+                try:
+                    evaluation = _direct_cdp(
+                        "Runtime.evaluate",
+                        {
+                            "expression": "({url: location.href, title: document.title})",
+                            "returnByValue": True,
+                        },
+                        session_id=target_sid,
+                        client_id=client_id,
+                        tab_id=tab_id,
+                        timeout=remaining,
+                        deadline=deadline,
+                    )
+                    if isinstance(evaluation, dict):
+                        remote = evaluation.get("result")
+                        if isinstance(remote, dict) and isinstance(remote.get("value"), dict):
+                            landing = dict(remote["value"])
+                except Exception as exc:
+                    landing_error = str(exc)
+                landed_url = str(landing.get("url") or "")
+                if landed_url and (
+                    not before_url
+                    or landed_url.rstrip("/") != before_url.rstrip("/")
+                    or landed_url.rstrip("/") == url.rstrip("/")
+                ):
+                    landing_observed = True
+                    break
+                time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+            if landing_observed:
+                result = {
+                    "status": "ok",
+                    "url": str(landing["url"]),
+                    "title": str(landing.get("title") or ""),
+                    "navigation": navigation,
+                    "bridge_route_error": str(route_error),
+                }
+            else:
+                result = {
+                    "status": "navigation_timeout",
+                    "url": "",
+                    "title": "",
+                    "navigation": navigation,
+                    "bridge_route_error": str(route_error),
+                    "landing_error": landing_error or (
+                        "navigation completed but the final URL/title could not be read "
+                        "within the total deadline"
+                    ),
+                }
     finally:
         if session_id is not None:
             driver.default_session_id = prev_default
@@ -1379,6 +1433,28 @@ def handle_dialog(
     finally:
         if session_id is not None:
             driver.default_session_id = prev_default
+    if result.get("ok") is False:
+        message = str(result.get("error") or "")
+        normalized = message.lower()
+        try:
+            decoded_error = json.loads(message)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            decoded_error = None
+        if isinstance(decoded_error, dict):
+            nested_message = decoded_error.get("message")
+            if nested_message:
+                message = f"{message} ({nested_message})"
+                normalized = message.lower()
+        if (
+            "no dialog" in normalized
+            or "no javascript dialog" in normalized
+            or "dialog is not showing" in normalized
+        ):
+            result["status"] = "no_dialog"
+            result.setdefault("handled", False)
+            result.setdefault("dialog", None)
+        else:
+            result["status"] = "dialog_handle_failed"
     result.setdefault("status", "blocked_by_dialog" if policy == "manual" else "ok")
     result["active_session_id"] = target_sid
     if result.get("status") in {"blocked_by_dialog", "dialog_handle_failed"}:
@@ -1394,7 +1470,8 @@ def handle_dialog(
 @mcp.tool(
     description=(
         "Resolve an intended beforeunload leave in one bounded workflow: protocol accept twice, "
-        "then a lab-only foreground Enter fallback after the normal physical-input approval gate."
+        "return immediately when no dialog exists, then use a lab-only foreground Enter fallback "
+        "after the normal physical-input approval gate only when protocol handling actually fails."
     )
 )
 async def resolve_leave_dialog(
@@ -1408,7 +1485,32 @@ async def resolve_leave_dialog(
             result = handle_dialog("accept", session_id=target_sid, timeout=3.0)
         except Exception as exc:
             result = {"status": "error", "error": str(exc)}
+        if result.get("status") == "error":
+            message = str(result.get("error") or "")
+            normalized = message.lower()
+            try:
+                decoded_error = json.loads(message)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                decoded_error = None
+            if isinstance(decoded_error, dict) and decoded_error.get("message"):
+                normalized = f"{normalized} {decoded_error['message']}".lower()
+            if (
+                "no dialog" in normalized
+                or "no javascript dialog" in normalized
+                or "dialog is not showing" in normalized
+            ):
+                result["status"] = "no_dialog"
+                result.setdefault("handled", False)
+                result.setdefault("dialog", None)
         attempts.append(result)
+        if result.get("status") == "no_dialog":
+            return {
+                **result,
+                "status": "no_dialog",
+                "resolution": "none",
+                "session_id": target_sid,
+                "attempts": attempts,
+            }
         if result.get("handled") is True or result.get("status") == "ok":
             return {
                 "status": "ok",
@@ -1417,6 +1519,26 @@ async def resolve_leave_dialog(
                 "attempts": attempts,
             }
         time.sleep(0.1)
+
+    if attempts and all(
+        str(item.get("status") or "") in {"error", "dialog_handle_failed"}
+        and (
+            isinstance(item.get("error"), str)
+            and (
+                "timeout" in item["error"].lower()
+                or "no response" in item["error"].lower()
+                or "did not respond" in item["error"].lower()
+            )
+        )
+        for item in attempts
+    ):
+        return {
+            "status": "no_response",
+            "session_id": target_sid,
+            "attempts": attempts,
+            "retryable": True,
+            "hint": "The dialog probe did not answer; no physical Enter was sent. Retry after list_tabs confirms the same owned session.",
+        }
 
     if _automation_mode() != "lab":
         return {
@@ -4287,13 +4409,15 @@ def storage_get(
         raw = resp.get("data")
         info = json.loads(raw) if isinstance(raw, str) else (raw or {})
     except Exception as exc:
-        is_timeout = isinstance(exc, TimeoutError) or "timeout" in str(exc).lower()
+        message = str(exc)
+        is_no_response = "no-response" in message.lower() or "no response" in message.lower()
+        is_timeout = isinstance(exc, TimeoutError) or "timeout" in message.lower()
         return {
             "status": "error",
             "area": store,
             "key": key,
-            "error_code": "timeout" if is_timeout else "bridge_error",
-            "error": str(exc),
+            "error_code": "no_response" if is_no_response else "timeout" if is_timeout else "bridge_error",
+            "error": message,
             "retryable": True,
             "hint": "The storage call failed in-page; the MCP connection remains usable. Run list_tabs, then retry the same directed session once.",
         }
@@ -4366,13 +4490,15 @@ def storage_set(
         raw = resp.get("data")
         info = json.loads(raw) if isinstance(raw, str) else (raw or {})
     except Exception as exc:
-        is_timeout = isinstance(exc, TimeoutError) or "timeout" in str(exc).lower()
+        message = str(exc)
+        is_no_response = "no-response" in message.lower() or "no response" in message.lower()
+        is_timeout = isinstance(exc, TimeoutError) or "timeout" in message.lower()
         return {
             "status": "error",
             "area": store,
             "key": key,
-            "error_code": "timeout" if is_timeout else "bridge_error",
-            "error": str(exc),
+            "error_code": "no_response" if is_no_response else "timeout" if is_timeout else "bridge_error",
+            "error": message,
             "retryable": True,
             "hint": "The write failed without closing MCP. Confirm with storage_get before retrying because a timed-out write may have landed.",
         }

@@ -160,6 +160,49 @@ def test_storage_timeout_is_structured_and_default_is_30_seconds(monkeypatch):
     assert result["retryable"] is True
 
 
+def test_storage_no_response_is_structured_and_followup_list_tabs_still_works(
+    monkeypatch,
+):
+    driver = _Driver()
+    _install(monkeypatch, driver)
+
+    def fail(*args, **kwargs):
+        raise RuntimeError(
+            "Bridge no-response (after_ack): script was delivered but no response"
+        )
+
+    monkeypatch.setattr(S, "exec_js", fail)
+
+    result = S.storage_get(timeout=0.01, session_id="chrome:profile:7")
+    tabs = S.list_tabs()
+
+    assert result["status"] == "error"
+    assert result["error_code"] == "no_response"
+    assert result["retryable"] is True
+    assert tabs["tabs"][0]["id"] == "chrome:profile:7"
+
+
+@pytest.mark.anyio
+async def test_execute_timeout_does_not_close_fastmcp_before_followup_list_tabs(
+    monkeypatch,
+):
+    driver = _Driver([TimeoutError("policy transport timed out")])
+    _install(monkeypatch, driver)
+
+    with pytest.raises(Exception, match="policy setup"):
+        await S.mcp.call_tool(
+            "execute_js",
+            {
+                "script": "return new Promise(() => {})",
+                "session_id": "chrome:profile:7",
+                "timeout": 0.01,
+            },
+        )
+
+    _, structured = await S.mcp.call_tool("list_tabs", {})
+    assert structured["tabs"][0]["id"] == "chrome:profile:7"
+
+
 def test_storage_dump_has_item_and_byte_bounds(monkeypatch):
     seen = {}
 
@@ -244,6 +287,17 @@ def test_open_url_unknown_command_fallback_uses_one_total_deadline(monkeypatch):
             time.sleep(0.03)
             if payload.get("cmd") == "navigate":
                 raise RuntimeError("Unknown cmd: navigate")
+            if payload.get("method") == "Runtime.evaluate":
+                return {
+                    "data": {
+                        "result": {
+                            "value": {
+                                "url": "https://landed.test/final",
+                                "title": "Landed title",
+                            }
+                        }
+                    }
+                }
             return {"data": {"frameId": "frame-7"}}
 
     driver = DeadlineDriver()
@@ -254,9 +308,136 @@ def test_open_url_unknown_command_fallback_uses_one_total_deadline(monkeypatch):
     )
 
     assert result["navigation_mode"] == "cdp_fallback"
-    assert len(driver.calls) == 2
+    assert result["status"] == "redirected"
+    assert result["url"] == "https://landed.test/final"
+    assert result["title"] == "Landed title"
+    assert len(driver.calls) == 3
     assert driver.calls[1][2] < driver.calls[0][2]
     assert driver.calls[1][0]["timeoutMs"] < driver.calls[0][0]["timeoutMs"]
+    assert driver.calls[2][2] < driver.calls[1][2]
+
+
+@pytest.mark.anyio
+async def test_resolve_leave_dialog_no_dialog_returns_without_physical_fallback(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        S,
+        "switch_session",
+        lambda session_id=None: session_id or "chrome:profile:7",
+    )
+    calls = []
+    monkeypatch.setattr(
+        S,
+        "handle_dialog",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or {
+            "status": "no_dialog",
+            "handled": False,
+            "url": "https://example.test/",
+        },
+    )
+
+    async def unexpected_physical(*args, **kwargs):
+        pytest.fail("no_dialog must not send a physical Enter fallback")
+
+    monkeypatch.setattr(S, "_run_approved_physical_action", unexpected_physical)
+
+    started = time.monotonic()
+    result = await S.resolve_leave_dialog(
+        ctx=SimpleNamespace(), session_id="chrome:profile:7"
+    )
+
+    assert time.monotonic() - started < 0.2
+    assert result["status"] == "no_dialog"
+    assert result["resolution"] == "none"
+    assert result["url"] == "https://example.test/"
+    assert len(calls) == 1
+
+
+@pytest.mark.anyio
+async def test_resolve_leave_dialog_normalizes_remote_json_no_dialog_error(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        S,
+        "switch_session",
+        lambda session_id=None: session_id or "chrome:profile:7",
+    )
+    calls = []
+    monkeypatch.setattr(
+        S,
+        "handle_dialog",
+        lambda *args, **kwargs: calls.append(1) or {
+            "status": "error",
+            "error": '{"code":-32602,"message":"No dialog is showing"}',
+        },
+    )
+
+    async def unexpected_physical(*args, **kwargs):
+        pytest.fail("remote no_dialog must not send a physical Enter fallback")
+
+    monkeypatch.setattr(S, "_run_approved_physical_action", unexpected_physical)
+    result = await S.resolve_leave_dialog(
+        ctx=SimpleNamespace(), session_id="chrome:profile:7"
+    )
+
+    assert result["status"] == "no_dialog"
+    assert result["resolution"] == "none"
+    assert calls == [1]
+
+
+@pytest.mark.anyio
+async def test_resolve_leave_dialog_timeout_does_not_send_physical_fallback(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        S,
+        "switch_session",
+        lambda session_id=None: session_id or "chrome:profile:7",
+    )
+    monkeypatch.setattr(
+        S,
+        "handle_dialog",
+        lambda *args, **kwargs: {
+            "status": "error",
+            "error": "extension did not respond within 3s",
+        },
+    )
+
+    async def unexpected_physical(*args, **kwargs):
+        pytest.fail("transport timeout must not send a physical Enter fallback")
+
+    monkeypatch.setattr(S, "_run_approved_physical_action", unexpected_physical)
+
+    result = await S.resolve_leave_dialog(
+        ctx=SimpleNamespace(), session_id="chrome:profile:7"
+    )
+
+    assert result["status"] == "no_response"
+    assert result["retryable"] is True
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "No dialog is showing",
+        "No JavaScript dialog open",
+        '{"code":-32602,"message":"No dialog is showing"}',
+    ],
+)
+def test_handle_dialog_normalizes_native_no_dialog_error(monkeypatch, message):
+    driver = _Driver([{"data": {"ok": False, "error": message}}])
+    _install(monkeypatch, driver)
+
+    result = S.handle_dialog(
+        "accept", session_id="chrome:profile:7", timeout=0.5
+    )
+
+    assert result["status"] == "no_dialog"
+    assert result["handled"] is False
+    assert result["dialog"] is None
+
+
 
 
 def test_open_url_session_resolution_uses_one_bounded_snapshot(monkeypatch):
@@ -490,6 +671,63 @@ def test_open_new_tab_returns_ready_session_without_caller_polling(monkeypatch):
     assert result["owned"] is True
     assert result["owner_id"]
     assert True in fresh_calls
+
+
+def test_open_new_tab_ready_session_executes_immediately_without_listing(monkeypatch):
+    class NewTabThenExecDriver(_Driver):
+        def newtab(self, url=None, client_id=None, timeout=15.0, active=True,
+                   operation_id=None):
+            return {
+                "data": {
+                    "id": 9,
+                    "url": url,
+                    "generation": "generation-ready",
+                    "status": "loading",
+                    "operation_status": "completed",
+                    "operation_id": operation_id,
+                    "client_id": client_id,
+                },
+                "client_id": client_id,
+            }
+
+        def ext_cmd(self, payload, client_id=None, timeout=15.0):
+            if payload.get("method") == "create_status":
+                return super().ext_cmd(payload, client_id=client_id, timeout=timeout)
+            self.calls.append((payload, client_id, timeout))
+            if payload.get("cmd") == "set_dialog_policy":
+                return {"data": {"token": "scope-ready"}}
+            return {"data": {"ok": True}}
+
+    driver = NewTabThenExecDriver()
+    _fresh_tab_ownership(monkeypatch)
+    sessions = [
+        {
+            "id": "chrome:profile:9",
+            "url": "https://example.com/",
+            "browser": "chrome",
+            "generation": "generation-ready",
+        }
+    ]
+    _install(monkeypatch, driver, sessions)
+    executed = []
+
+    def execute(script, driver_arg, **kwargs):
+        executed.append((script, kwargs["session_id"]))
+        return {"status": "success", "js_return": 2, "tab_id": 9}
+
+    monkeypatch.setattr(S.simphtml, "execute_js_rich", execute)
+
+    created = S.open_new_tab("https://example.com/", active=False, timeout=1.0)
+    immediate = S.execute_js(
+        "1+1", session_id=created["session_id"], no_monitor=True, timeout=1.0
+    )
+
+    assert created["ready"] is True
+    assert created["generation"] == "generation-ready"
+    assert created["owned"] is True
+    assert created["owner_id"]
+    assert immediate["js_return"] == 2
+    assert executed == [("/*__tmwd_dialog_scope:scope-ready*/\n1+1", created["session_id"])]
 
 
 def test_open_new_tab_reconciles_lost_create_ack_to_exact_session(monkeypatch):
@@ -901,6 +1139,23 @@ def test_close_tabs_default_refuses_preexisting_user_tab(monkeypatch):
 
     with pytest.raises(PermissionError, match="not owned by this MCP task"):
         S.close_tabs("chrome:profile:7", owner_id="not-the-owner")
+
+    assert driver.calls == []
+
+
+def test_close_tabs_without_owner_refuses_before_snapshot_or_mutation(monkeypatch):
+    driver = _Driver()
+    monkeypatch.setattr(S, "require_driver", lambda: driver)
+    monkeypatch.setattr(
+        S,
+        "active_sessions",
+        lambda *args, **kwargs: pytest.fail(
+            "missing owner_id must be rejected before reading shared browser state"
+        ),
+    )
+
+    with pytest.raises(PermissionError, match="owner_id is required"):
+        S.close_tabs("chrome:profile:7")
 
     assert driver.calls == []
 
