@@ -138,37 +138,39 @@ def scratch_session(driver):
     import time
 
     result = S.open_new_tab("https://example.com/")
-    tab_id = result["result"]["data"]["id"]
+    if result.get("status") == "unknown" or not result.get("owned"):
+        pytest.fail(f"scratch tab create was not safely attributable: {result}")
+    sid = result["session_id"]
+    generation = result["generation"]
     owner_id = result.get("owner_id")
 
-    sid = None
-    for _ in range(20):
-        for s in driver.get_all_sessions():
-            if str(s["id"]).endswith(f":{tab_id}"):
-                sid = s["id"]
-                break
-        if sid:
-            break
-        time.sleep(0.5)
-    if not sid:
-        pytest.skip("scratch tab never registered a session")
-
-    # server.active_sessions() is cached, and switch_session() looks the target
-    # up in that cache. Without this the brand-new tab is "not found" even
-    # though the bridge already knows about it.
-    S.invalidate_sessions_cache()
-    for _ in range(10):
-        if any(str(s.get("id")) == sid for s in S.active_sessions(fresh=True)):
-            break
-        time.sleep(0.5)
-
-    yield sid
-
     try:
-        S.close_tabs(
-            tab_id,
-            session_id=sid,
-            owner_id=owner_id,
-        )
-    except Exception:
-        pass
+        registered = False
+        for _ in range(20):
+            registered = any(
+                str(s.get("id")) == sid
+                and str(s.get("generation") or "") == str(generation)
+                for s in driver.get_all_sessions()
+            )
+            if registered:
+                break
+            time.sleep(0.5)
+        if not registered:
+            pytest.fail(f"scratch tab never registered its exact generation: {result}")
+
+        # server.active_sessions() is cached, and switch_session() looks the target
+        # up in that cache. Without this the brand-new tab is "not found" even
+        # though the bridge already knows about it.
+        S.invalidate_sessions_cache()
+        for _ in range(10):
+            if any(
+                str(s.get("id")) == sid
+                and str(s.get("generation") or "") == str(generation)
+                for s in S.active_sessions(fresh=True)
+            ):
+                break
+            time.sleep(0.5)
+
+        yield sid
+    finally:
+        S.close_tabs(sid, session_id=sid, owner_id=owner_id)

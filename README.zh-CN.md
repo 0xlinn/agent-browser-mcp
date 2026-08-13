@@ -4,7 +4,7 @@
 
 一个 MCP 服务,让你的 Agent 直接操作**你正在使用的那个真实 Chrome** —— 通过 Chrome 扩展和 CDP 协议接入。Agent 工作在你已有的浏览器会话里,登录态、Cookies、已打开的标签页原本就在,不需要再开一个沙盒浏览器重新登录一遍。
 
-当前版本:Python 包 **0.2.1** + Chrome unpacked 扩展 **2.1.2**。
+当前版本:Python 包 **0.2.2** + Chrome unpacked 扩展 **2.1.3**。
 
 它也能越过页面层:在操作系统级别发出真实的鼠标和键盘输入,应对页面内 JavaScript 不够用的场景。那五个工具是仅有的会碰你桌面的工具;`safe` 模式逐次批准,本机默认的 `lab` 模式复用本次会话批准,也可显式关闭询问。
 
@@ -260,7 +260,7 @@ ABM 首次使用时创建 `~/.agent-browser-mcp/bridge-token`,桥和所有 MCP �
   - `url`(string)、`session_id`(string,可选)、`timeout`(number,可选)、`beforeunload`(string,可选)、`intent_leave`(boolean,可选):`false` 强制保留页面
 - **download_file** —— 通过 Chrome 原生下载管理器下载 HTTP(S) URL,使用该浏览器 profile 的 Cookie 和登录态。默认等待完成,返回 `status="completed"` 和已验证的绝对 `path`;中断返回 `failed`,超时或 `wait=false` 返回带 `download_id` 的 `in_progress`。显式 `session_id` 必须仍存活,不会静默改用其它 profile。附件应使用本工具,不要在页面里 `fetch`
   - `url`(string)、`filename`(string,可选):相对下载名称、`directory`(string,可选):任意绝对目标目录并自动建父目录;要求 `wait=true`、`wait`(boolean,可选):默认 `true`、`timeout`(number,可选):默认 60 秒,最大 1800、`session_id`(string,可选):选择浏览器 profile、`overwrite`(boolean,可选):默认 `false`,最终目标已存在时拒绝,只有显式 `true` 才替换。带 `directory` 的调用若超时会返回 `directory_applied=false`:后续搬移不再受跟踪,Chrome 可能继续下载到浏览器默认目录
-- **open_new_tab** —— 新开标签页并有界等待精确 session/generation 注册,返回 `{tab_id,session_id,generation,ready,owned,opener,owner_id,load_status}`;create ACK 一旦给出 `tab_id+generation` 就登记 owned,即使 `ready=false`;`ready` 只表示 session 工具能否立即使用。保存随机 `owner_id` capability,只用于该任务收尾
+- **open_new_tab** —— 为本次创建生成唯一 `operation_id`,新开标签页并有界等待精确 session/generation 注册,返回 `{operation_id,tab_id,session_id,generation,ready,owned,opener,owner_id,load_status}`。扩展对相同 operation id 去重;只有包含精确 `client_id+tab_id+generation` 的 completed 记录才登记 ownership,即使 `ready=false`;`ready` 只表示 session 工具能否立即使用。创建投递前 registry 不确定时返回 `status="unknown",may_have_created=false,retry_safe=true`;创建已投递但 ACK/对账仍不确定时返回 `status="unknown",may_have_created=true,retry_safe=false`。保存随机 `owner_id` capability,只用于该任务收尾;禁止不用原 operation_id 重试 create
   - `url`(string)、`timeout`(number,可选)、`active`(boolean,可选)、`session_id`(string,可选):选择浏览器/profile、`owner_id`(string,可选):让同一任务的多个新 tab 共用一个 owner
 - **close_tabs** —— *(零标签页可用)* 接受原生数字 tab id 或完整 `client:tabId` session id;对 `chrome-extension://` 页面也有效。默认 `only_if_agent_owned=true`,必须传 `open_new_tab` 返回的 `owner_id`,并在关闭前核对当前 lifecycle generation;用户预存 tab、其它 Agent 的 tab、复用 id 的新生命周期都会拒绝。若用户已手动关掉 owned tab,收尾返回 `status=already_gone, closed_by=user`,不会拿旧原生 id 补关;真正关闭 owned tab 才返回 `closed_by=agent`;显式关闭非 owned/U 的 operator override 返回 `closed_by=none`,不会计入本任务 owned 清理。仅当用户明确要求关闭非 owned/U tab 时才设 `only_if_agent_owned=false`
   - `tab_id`(integer/string 或数组)、`session_id`(string,可选)、`owner_id`(string,安全默认下必填)、`only_if_agent_owned`(boolean,默认 `true`)

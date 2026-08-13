@@ -962,8 +962,11 @@ class TMWebDriver:
         return self.default_session_id  
     
     def jump(self, url, timeout=10): self.execute_js(f"window.location.href={json.dumps(url)}", timeout=timeout)
-    def newtab(self, url=None, client_id=None, timeout=15, active=True):
+    def newtab(self, url=None, client_id=None, timeout=15, active=True,
+               operation_id=None):
         if url is None: url = "http://www.baidu.com/robots.txt"
+        if operation_id is None or not str(operation_id).strip():
+            raise ValueError("newtab requires a non-empty operation_id")
         # Native chrome.tabs.create, addressed to the extension itself so it
         # works with no tabs open. (The old GM_openInTab was a Tampermonkey-only
         # API absent from a plain extension, so it always threw ReferenceError.)
@@ -973,6 +976,12 @@ class TMWebDriver:
             "url": url,
             "active": bool(active),
         }
+        payload["operation_id"] = str(operation_id)
+        if client_id is not None:
+            # The extension must persist the browser namespace with the
+            # operation so a completed result remains addressable even when
+            # there are no scriptable content sessions.
+            payload["client_id"] = str(client_id)
         try:
             return self.ext_cmd(payload, client_id=client_id, timeout=timeout)
         except TimeoutError:
@@ -981,11 +990,11 @@ class TMWebDriver:
             # there just burns another timeout — and if the tab DID open, the
             # fallback would open a second one. Surface it instead.
             raise
-        except Exception as e:
-            # Older bridge daemon without /link ext_cmd: fall back to the tab
-            # session route, which still works whenever at least one tab lives.
-            print(f"ext_cmd 不可用({e})，回退到 session 通道")
-            return self.execute_js(json.dumps(payload))
+        except Exception:
+            # Never replay a tab creation through another route. Even with an
+            # operation id, a different route can select another browser; the
+            # caller must reconcile through the pinned extension client.
+            raise
     
 if __name__ == "__main__":
     driver = TMWebDriver(host='127.0.0.1', port=18765)

@@ -1271,6 +1271,21 @@ def _extension_data(response: Any) -> dict[str, Any]:
     return dict(data) if isinstance(data, dict) else dict(response)
 
 
+def _response_client_id(response: Any, fallback: Optional[str]) -> Optional[str]:
+    """Keep the client namespace when an extension result is unwrapped."""
+    if isinstance(response, dict) and response.get("client_id") is not None:
+        return str(response["client_id"])
+    if isinstance(response, dict) and response.get("clientId") is not None:
+        return str(response["clientId"])
+    if isinstance(response, dict) and isinstance(response.get("data"), dict):
+        nested = response["data"]
+        if nested.get("client_id") is not None:
+            return str(nested["client_id"])
+        if nested.get("clientId") is not None:
+            return str(nested["clientId"])
+    return fallback
+
+
 def _classify_navigation_result(
     result: dict[str, Any], requested_url: str
 ) -> dict[str, Any]:
@@ -1440,7 +1455,7 @@ async def resolve_leave_dialog(
     }
 
 
-@mcp.tool(description="Open a real-browser tab and wait a bounded time for its exact lifecycle generation to register. A ready tab is registered as owned by this MCP task and returns owned=true plus a random owner_id capability; pass that owner_id to close_tabs during cleanup. Returns tab_id, session_id, generation, ready, URL, and load status so a reused native id cannot match a stale tab.")
+@mcp.tool(description="Open one real-browser tab with an operation_id-backed exactly-once create. If the create ACK is lost, the same operation_id is reconciled within one total deadline; a completed result is registered only with its exact client_id, tab_id, and generation. Before create is dispatched, an unresolved probe returns status=unknown, may_have_created=false, retry_safe=true; after dispatch, an unresolved operation returns status=unknown, may_have_created=true, retry_safe=false and the operation_id. Never use a URL-based guess or an unmarked create retry.")
 def open_new_tab(
     url: str,
     timeout: float = 15.0,
@@ -1452,97 +1467,334 @@ def open_new_tab(
     if timeout <= 0:
         raise ValueError("timeout must be greater than zero")
     deadline = time.monotonic() + float(timeout)
-    client_id = _implicit_client_id(session_id)
-    result = driver.newtab(
-        url, client_id=client_id, timeout=timeout, active=active
-    )
-    if isinstance(result, dict) and result.get("client_id") is not None:
-        client_id = str(result["client_id"])
-    info = _extension_data(result)
-    if info.get("ok") is True and isinstance(info.get("data"), dict):
-        info = dict(info["data"])
+    operation_id = f"open-tab-{secrets.token_urlsafe(18)}"
+    client_id = _split_session_target(str(session_id))[0] if session_id is not None else None
+
+    def remaining() -> float:
+        return max(0.0, deadline - time.monotonic())
+
+    def create_call() -> Any:
+        left = remaining()
+        if left <= 0:
+            raise TimeoutError("open_new_tab total deadline exhausted before create")
+        # Leave a meaningful reconciliation window after a lost ACK. The
+        # extension itself remains the exactly-once authority for this id.
+        ack_timeout = min(left, max(0.001, min(2.0, left * 0.5)))
+        return driver.newtab(
+            url=url, client_id=client_id, timeout=ack_timeout, active=active,
+            operation_id=operation_id,
+        )
+
+    def response_info(response: Any) -> tuple[dict[str, Any], Optional[str]]:
+        routed_client = _response_client_id(response, client_id)
+        info = _extension_data(response)
+        nested = info.get("data")
+        if isinstance(nested, dict) and (
+            "operation_id" in nested or "operation_status" in nested
+        ):
+            nested_info = dict(nested)
+            if info.get("error") and not nested_info.get("error"):
+                nested_info["error"] = info["error"]
+            info = nested_info
+        return info, routed_client
+
+    def operation_state(info: dict[str, Any]) -> str:
+        if str(info.get("operation_id") or "") != operation_id:
+            return "unknown"
+        return str(info.get("operation_status") or "unknown").lower()
+
+    def unknown_result(
+        info: Optional[dict[str, Any]] = None,
+        *,
+        may_have_created: bool,
+        retry_safe: bool,
+    ) -> dict[str, Any]:
+        detail = dict(info or {})
+        detail.setdefault("status", "unknown")
+        detail.setdefault("operation_status", "unknown")
+        detail.update({
+            "operation_id": operation_id,
+            "client_id": client_id,
+            "may_have_created": may_have_created,
+            "retry_safe": retry_safe,
+        })
+        return {
+            "status": "unknown",
+            "operation_id": operation_id,
+            "client_id": client_id,
+            "tab_id": detail.get("id", detail.get("tab_id")),
+            "generation": detail.get("generation"),
+            "session_id": None,
+            "ready": False,
+            "owned": False,
+            "may_have_created": may_have_created,
+            "retry_safe": retry_safe,
+            "reconciliation": detail,
+        }
+
+    def not_created_result(info: dict[str, Any]) -> dict[str, Any]:
+        detail = dict(info)
+        detail.update({
+            "operation_id": operation_id,
+            "client_id": client_id,
+            "may_have_created": False,
+            "retry_safe": True,
+        })
+        return {
+            "status": "error",
+            "operation_id": operation_id,
+            "client_id": client_id,
+            "tab_id": None,
+            "generation": None,
+            "session_id": None,
+            "ready": False,
+            "owned": False,
+            "may_have_created": False,
+            "retry_safe": True,
+            "error": detail.get("error") or "the browser did not create the tab",
+            "reconciliation": detail,
+        }
+
+    def status_call() -> Any:
+        left = remaining()
+        if left <= 0:
+            raise TimeoutError("open_new_tab total deadline exhausted before reconciliation")
+        return driver.ext_cmd(
+            {"cmd": "tabs", "method": "create_status", "operation_id": operation_id},
+            client_id=client_id,
+            timeout=min(left, 1.0),
+        )
+
+    # Pin one concrete extension before the first mutation. This works with no
+    # content sessions and prevents create/status from drifting across browsers.
+    try:
+        probe_response = status_call()
+        probe_info, routed_client = response_info(probe_response)
+    except Exception as exc:
+        return unknown_result(
+            {"error": str(exc), "phase": "client_discovery"},
+            may_have_created=False,
+            retry_safe=True,
+        )
+    if client_id is not None and routed_client is not None and routed_client != client_id:
+        return unknown_result(
+            {"error": "client discovery reached a different browser client"},
+            may_have_created=False,
+            retry_safe=False,
+        )
+    client_id = routed_client
+    if not client_id:
+        return unknown_result(
+            {"error": "the bridge did not identify the extension client"},
+            may_have_created=False,
+            retry_safe=True,
+        )
+    if operation_state(probe_info) != "not_found":
+        return unknown_result(
+            probe_info,
+            # This operation id was generated locally and no mutation has been
+            # dispatched yet, so a structured storage/registry uncertainty in
+            # the read-only probe cannot mean that this call created a tab.
+            may_have_created=False,
+            retry_safe=True,
+        )
+
+    result: Any = None
+    last_status = dict(probe_info)
+    create_attempts = 1
+    create_timed_out = False
+    try:
+        create_response = create_call()
+        create_info, routed_client = response_info(create_response)
+        if routed_client is not None and routed_client != client_id:
+            return unknown_result(
+                {"error": "the create ACK came from a different browser client"},
+                may_have_created=True,
+                retry_safe=False,
+            )
+        last_status = create_info
+        create_state = operation_state(create_info)
+        if create_state == "completed":
+            result = create_response
+        elif create_state == "not_found":
+            return not_created_result(create_info)
+        elif create_state == "unknown":
+            return unknown_result(
+                create_info,
+                may_have_created=bool(create_info.get("may_have_created")),
+                retry_safe=bool(create_info.get("retry_safe", False)),
+            )
+    except TimeoutError:
+        create_timed_out = True
+    except Exception as exc:
+        last_status = {
+            "error": str(exc),
+            "phase": "create",
+            "operation_id": operation_id,
+            "operation_status": "unknown",
+        }
+
+    # A direct pending ACK and a lost ACK share the same reconciliation path.
+    # Only a timed-out create may have been undelivered, so only that case may
+    # resend create once, always with the same operation and pinned client ids.
+    while result is None and remaining() > 0:
+        try:
+            status_response = status_call()
+            status_info, routed_client = response_info(status_response)
+            if routed_client is not None and routed_client != client_id:
+                return unknown_result(
+                    {"error": "reconciliation reached a different browser client"},
+                    may_have_created=True,
+                    retry_safe=False,
+                )
+            last_status = status_info
+        except TimeoutError:
+            continue
+        except Exception as exc:
+            last_status = {
+                "error": str(exc),
+                "phase": "reconciliation",
+                "operation_id": operation_id,
+                "operation_status": "unknown",
+            }
+            break
+
+        state = operation_state(last_status)
+        if state == "completed":
+            result = status_response
+            break
+        if state == "not_found" and create_timed_out and create_attempts < 2:
+            create_attempts += 1
+            try:
+                retry_response = create_call()
+                create_timed_out = False
+                retry_info, routed_client = response_info(retry_response)
+                if routed_client is not None and routed_client != client_id:
+                    return unknown_result(
+                        {"error": "the create retry ACK came from a different browser client"},
+                        may_have_created=True,
+                        retry_safe=False,
+                    )
+                last_status = retry_info
+                retry_state = operation_state(retry_info)
+                if retry_state == "completed":
+                    result = retry_response
+                    break
+                if retry_state == "not_found":
+                    return not_created_result(retry_info)
+                if retry_state == "unknown":
+                    return unknown_result(
+                        retry_info,
+                        may_have_created=bool(retry_info.get("may_have_created", True)),
+                        retry_safe=bool(retry_info.get("retry_safe", False)),
+                    )
+            except TimeoutError:
+                create_timed_out = True
+            except Exception as exc:
+                last_status = {
+                    "error": str(exc),
+                    "phase": "create_retry",
+                    "operation_id": operation_id,
+                    "operation_status": "unknown",
+                }
+            continue
+        if state not in {"pending", "not_found"}:
+            break
+        if state == "not_found" and create_timed_out and create_attempts >= 2:
+            return not_created_result(last_status)
+        time.sleep(min(0.05, remaining()))
+
+    if result is None:
+        return unknown_result(last_status, may_have_created=True, retry_safe=False)
+
+    info, routed_client = response_info(result)
+    if routed_client is not None and routed_client != client_id:
+        return unknown_result(
+            {"error": "the completed operation belongs to a different browser client"},
+            may_have_created=True,
+            retry_safe=False,
+        )
+    if operation_state(info) != "completed":
+        return unknown_result(info, may_have_created=True, retry_safe=False)
+    record_client = info.get("client_id")
+    if record_client is not None and str(record_client) != client_id:
+        return unknown_result(
+            {**info, "error": "the completed operation record has a different client_id"},
+            may_have_created=True,
+            retry_safe=False,
+        )
     raw_tab_id = info.get("id", info.get("tab_id"))
-    if raw_tab_id is None:
-        raise RuntimeError(f"open_new_tab did not return a native tab id: {result!r}")
-    tab_id = int(raw_tab_id)
-    generation = info.get("generation")
-    if generation is not None:
-        generation = str(generation)
+    generation = str(info.get("generation") or "")
+    if raw_tab_id is None or not generation:
+        return unknown_result(
+            {**info, "error": "completed create result lacks an exact tab_id or generation"},
+            may_have_created=True,
+            retry_safe=False,
+        )
+    try:
+        tab_id = int(raw_tab_id)
+    except (TypeError, ValueError):
+        return unknown_result(
+            {**info, "error": "completed create result has an invalid tab_id"},
+            may_have_created=True,
+            retry_safe=False,
+        )
     invalidate_sessions_cache()
-    expected_sid = f"{client_id}:{tab_id}" if client_id else None
+    expected_sid = f"{client_id}:{tab_id}"
     found_sid: Optional[str] = None
     found_url = str(info.get("url") or url)
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
+    while remaining() > 0:
+        left = remaining()
         try:
-            sessions = active_sessions(timeout=min(2.0, remaining), fresh=True)
+            sessions = active_sessions(timeout=min(2.0, left), fresh=True)
         except Exception:
             sessions = []
         match = next(
             (
-                session for session in sessions
-                if (
-                    (
-                        (expected_sid and str(session.get("id")) == expected_sid)
-                        or (
-                            not expected_sid
-                            and str(session.get("id", "")).endswith(f":{tab_id}")
-                        )
-                    )
-                    and (
-                        generation is None
-                        or str(session.get("generation")) == generation
-                    )
-                )
+                session
+                for session in sessions
+                if str(session.get("id")) == expected_sid
+                and str(session.get("generation") or "") == generation
             ),
             None,
         )
         if match:
-            found_sid = str(match.get("id"))
+            found_sid = expected_sid
             found_url = str(match.get("url") or found_url)
             break
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-        time.sleep(min(0.1, remaining))
+        time.sleep(min(0.1, remaining()))
     # Exact session+generation registration is the readiness barrier for
     # session-scoped tools.  The extension now acknowledges chrome.tabs.create
     # immediately, so its initial tab.status is commonly "loading"; retaining
     # that snapshot as a second gate would leave a permanently pending result
     # even after the content session has registered and is executable.
-    ready = bool(found_sid)
-    ownership: Optional[dict[str, str]] = None
-    ownership_sid = found_sid or expected_sid
-    if ownership_sid and generation is not None:
-        ownership = _TAB_OWNERSHIP.register(
-            ownership_sid,
-            generation,
-            owner_id=owner_id,
-        )
+    ready = found_sid is not None
+    # Restricted pages may never register a content session. The exact native
+    # client/id/generation tuple is nevertheless sufficient for safe cleanup.
+    ownership = _TAB_OWNERSHIP.register(
+        expected_sid,
+        generation,
+        owner_id=owner_id,
+    )
     out: dict[str, Any] = {
         "status": "ok" if ready else "pending",
+        "operation_id": operation_id,
+        "client_id": client_id,
         "tab_id": tab_id,
         "session_id": found_sid or expected_sid,
         "generation": generation,
         "ready": ready,
         "url": found_url,
         "load_status": info.get("status"),
-        "owned": ownership is not None,
+        "owned": True,
         "opener": "agent",
-        "owner_id": ownership["owner_id"] if ownership else None,
+        "owner_id": ownership["owner_id"],
         "result": result,
     }
     if not ready:
         out["hint"] = (
-            "The native tab exists but its session did not register before the bounded timeout. "
-            "Use the returned tab_id with cdp_command, or list_tabs once before session tools."
-        )
-    elif generation is None:
-        out["hint"] = (
-            "The tab is ready, but the loaded extension did not return a lifecycle generation, "
-            "so ABM did not mark it owned. Reload the unpacked extension before relying on safe cleanup."
+            "The native tab exists but its exact content session did not register before the "
+            "bounded timeout. The returned owner_id can safely close it."
         )
     return out
 

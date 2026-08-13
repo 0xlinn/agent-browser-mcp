@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 from pathlib import Path
 import subprocess
+import tempfile
 import time
 from types import SimpleNamespace
 
@@ -23,6 +25,31 @@ BACKGROUND = (
 )
 
 
+def _run_node_script(script: str) -> dict:
+    handle, path = tempfile.mkstemp(suffix=".js")
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8", newline="\n") as stream:
+            stream.write(script)
+        completed = subprocess.run(["node", path], capture_output=True, text=True)
+        if completed.returncode:
+            raise AssertionError(f"node harness failed: {completed.stderr.strip()}")
+        return json.loads(completed.stdout)
+    finally:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+
+
+def _create_operation_source() -> str:
+    source = BACKGROUND.read_text(encoding="utf-8")
+    prefix_start = source.index("const CREATE_OPERATIONS_KEY")
+    prefix_end = source.index("\n\nfunction newTabGeneration", prefix_start)
+    create_start = source.index("async function createTabAck")
+    create_end = source.index("\n\nasync function handleExtMessage", create_start)
+    return source[prefix_start:prefix_end] + "\n" + source[create_start:create_end]
+
+
 class _Driver:
     def __init__(self, responses=None, default="chrome:profile:7"):
         self.default_session_id = default
@@ -31,6 +58,20 @@ class _Driver:
 
     def ext_cmd(self, payload, client_id=None, timeout=15.0):
         self.calls.append((payload, client_id, timeout))
+        if payload.get("method") == "create_status":
+            routed_client = client_id
+            if routed_client is None and self.default_session_id:
+                routed_client = str(self.default_session_id).rsplit(":", 1)[0]
+            return {
+                "data": {
+                    "status": "not_found",
+                    "operation_status": "not_found",
+                    "operation_id": payload["operation_id"],
+                    "may_have_created": False,
+                    "retry_safe": True,
+                },
+                "client_id": routed_client or "chrome:profile",
+            }
         if self.responses:
             response = self.responses.pop(0)
             if isinstance(response, BaseException):
@@ -410,15 +451,21 @@ def test_close_tabs_accepts_composite_identifiers(monkeypatch):
 
 def test_open_new_tab_returns_ready_session_without_caller_polling(monkeypatch):
     class NewTabDriver(_Driver):
-        def newtab(self, url=None, client_id=None, timeout=15.0, active=True):
-            self.calls.append((url, client_id, timeout, active))
+        def newtab(self, url=None, client_id=None, timeout=15.0, active=True,
+                   operation_id=None):
+            self.calls.append((url, client_id, timeout, active, operation_id))
             return {
                 "data": {
                     "id": 9,
                     "url": url,
+                    "generation": "generation-ready",
                     "load_ready": True,
                     "status": "complete",
-                }
+                    "operation_status": "completed",
+                    "operation_id": operation_id,
+                    "client_id": client_id,
+                },
+                "client_id": client_id,
             }
 
     driver = NewTabDriver()
@@ -428,7 +475,8 @@ def test_open_new_tab_returns_ready_session_without_caller_polling(monkeypatch):
     def sessions(timeout=None, fresh=False):
         fresh_calls.append(fresh)
         return _sessions() + (
-            [{"id": "chrome:profile:9", "url": "https://new.test/"}]
+            [{"id": "chrome:profile:9", "url": "https://new.test/",
+              "generation": "generation-ready"}]
             if fresh
             else []
         )
@@ -439,15 +487,362 @@ def test_open_new_tab_returns_ready_session_without_caller_polling(monkeypatch):
     assert result["tab_id"] == 9
     assert result["session_id"] == "chrome:profile:9"
     assert result["ready"] is True
-    assert result["owned"] is False
-    assert result["owner_id"] is None
+    assert result["owned"] is True
+    assert result["owner_id"]
     assert True in fresh_calls
+
+
+def test_open_new_tab_reconciles_lost_create_ack_to_exact_session(monkeypatch):
+    class LostAckDriver(_Driver):
+        def newtab(self, url=None, client_id=None, timeout=15.0, active=True,
+                   operation_id=None):
+            self.calls.append(("create", url, client_id, timeout, active, operation_id))
+            raise TimeoutError("create ACK lost")
+
+        def ext_cmd(self, payload, client_id=None, timeout=15.0):
+            self.calls.append((payload, client_id, timeout))
+            assert payload["method"] == "create_status"
+            assert payload["operation_id"]
+            status_calls = sum(
+                1 for call in self.calls
+                if isinstance(call[0], dict) and call[0].get("method") == "create_status"
+            )
+            if status_calls == 1:
+                return {"data": {"status": "not_found", "operation_status": "not_found",
+                                  "operation_id": payload["operation_id"]},
+                        "client_id": "chrome:profile"}
+            return {"data": {"status": "loading", "operation_status": "completed",
+                              "operation_id": payload["operation_id"], "id": 42,
+                              "generation": "generation-exact", "client_id": "chrome:profile",
+                              "url": "https://new.test/", "load_ready": False},
+                    "client_id": "chrome:profile"}
+
+    driver = LostAckDriver(default=None)
+    _fresh_tab_ownership(monkeypatch)
+    _install(monkeypatch, driver, [{"id": "chrome:profile:42", "url": "https://new.test/",
+                                    "browser": "chrome", "generation": "generation-exact"}])
+
+    result = S.open_new_tab("https://new.test/", timeout=1.0)
+
+    assert result["ready"] is True
+    assert result["session_id"] == "chrome:profile:42"
+    assert result["generation"] == "generation-exact"
+    assert result["operation_id"]
+    create = next(call for call in driver.calls if call[0] == "create")
+    assert create[-1] == result["operation_id"]
+
+
+def test_open_new_tab_structured_probe_unknown_is_safe_before_create(monkeypatch):
+    driver = _Driver(default=None)
+    calls = []
+
+    def ext_cmd(payload, client_id=None, timeout=15):
+        calls.append((payload, client_id))
+        assert payload["method"] == "create_status"
+        return {
+            "data": {
+                "operation_id": payload["operation_id"],
+                "operation_status": "unknown",
+                "status": "unknown",
+                "may_have_created": True,
+                "retry_safe": False,
+            },
+            "client_id": "chrome:profile",
+        }
+
+    driver.ext_cmd = ext_cmd
+    driver.newtab = lambda *args, **kwargs: pytest.fail("probe uncertainty must not dispatch create")
+    _install(monkeypatch, driver)
+    result = S.open_new_tab("https://probe-unknown.test/", timeout=1.0)
+    assert result["status"] == "unknown"
+    assert result["may_have_created"] is False
+    assert result["retry_safe"] is True
+    assert len(calls) == 1
+
+
+def test_open_new_tab_retries_same_operation_only_when_status_is_not_found(monkeypatch):
+    class RetryDriver(_Driver):
+        def newtab(self, url=None, client_id=None, timeout=15.0, active=True,
+                   operation_id=None):
+            self.calls.append(("create", url, client_id, timeout, active, operation_id))
+            if sum(1 for call in self.calls if call[0] == "create") == 1:
+                raise TimeoutError("first command was not delivered")
+            return {"data": {"id": 43, "generation": "generation-retried", "url": url,
+                              "status": "loading", "operation_status": "completed",
+                              "operation_id": operation_id, "client_id": client_id,
+                              "load_ready": False}, "client_id": client_id}
+
+        def ext_cmd(self, payload, client_id=None, timeout=15.0):
+            self.calls.append((payload, client_id, timeout))
+            assert payload["operation_id"]
+            return {"data": {"status": "not_found", "operation_status": "not_found",
+                              "operation_id": payload["operation_id"]},
+                    "client_id": "chrome:profile"}
+
+    driver = RetryDriver(default=None)
+    _fresh_tab_ownership(monkeypatch)
+    _install(monkeypatch, driver, [{"id": "chrome:profile:43", "url": "https://retry.test/",
+                                    "browser": "chrome", "generation": "generation-retried"}])
+
+    result = S.open_new_tab("https://retry.test/", timeout=1.0)
+
+    creates = [call for call in driver.calls if call[0] == "create"]
+    assert len(creates) == 2
+    assert creates[0][-1] == creates[1][-1] == result["operation_id"]
+    assert result["session_id"] == "chrome:profile:43"
+
+
+def test_open_new_tab_reconciliation_never_claims_same_url_from_other_agent(monkeypatch):
+    class LostAckDriver(_Driver):
+        def newtab(self, url=None, client_id=None, timeout=15.0, active=True,
+                   operation_id=None):
+            self.calls.append(("create", url, client_id, timeout, active, operation_id))
+            raise TimeoutError("create ACK lost")
+
+        def ext_cmd(self, payload, client_id=None, timeout=15.0):
+            self.calls.append((payload, client_id, timeout))
+            status_calls = sum(
+                1 for call in self.calls
+                if isinstance(call[0], dict) and call[0].get("method") == "create_status"
+            )
+            state = "not_found" if status_calls == 1 else "pending"
+            return {"data": {"status": state, "operation_status": state,
+                              "operation_id": payload["operation_id"],
+                              "may_have_created": state == "pending", "retry_safe": state == "not_found"},
+                    "client_id": "chrome:profile"}
+
+    driver = LostAckDriver(default=None)
+    _fresh_tab_ownership(monkeypatch)
+    _install(monkeypatch, driver, [
+        {"id": "chrome:profile:7", "url": "https://same.test/", "browser": "chrome",
+         "generation": "user-generation"},
+    ])
+
+    result = S.open_new_tab("https://same.test/", timeout=0.08)
+
+    assert result["status"] == "unknown"
+    assert result["may_have_created"] is True
+    assert result["retry_safe"] is False
+    assert result["operation_id"]
+    assert result["session_id"] is None
+    assert result["owned"] is False
+
+
+def test_open_new_tab_preserves_real_client_id_with_zero_scriptable_sessions(monkeypatch):
+    class LostAckDriver(_Driver):
+        def newtab(self, url=None, client_id=None, timeout=15.0, active=True,
+                   operation_id=None):
+            assert client_id == "chrome:profile"
+            self.calls.append(("create", url, client_id, timeout, active, operation_id))
+            raise TimeoutError("create ACK lost")
+
+        def ext_cmd(self, payload, client_id=None, timeout=15.0):
+            self.calls.append((payload, client_id, timeout))
+            status_calls = sum(
+                1 for call in self.calls
+                if isinstance(call[0], dict) and call[0].get("method") == "create_status"
+            )
+            assert client_id is None if status_calls == 1 else client_id == "chrome:profile"
+            if status_calls == 1:
+                return {"data": {"status": "not_found", "operation_status": "not_found",
+                                  "operation_id": payload["operation_id"]},
+                        "client_id": "chrome:profile"}
+            return {"data": {"status": "loading", "operation_status": "completed",
+                              "operation_id": payload["operation_id"], "id": 44,
+                              "generation": "generation-restricted", "client_id": "chrome:profile",
+                              "url": "chrome://extensions/"}, "client_id": "chrome:profile"}
+
+    driver = LostAckDriver(default=None)
+    _fresh_tab_ownership(monkeypatch)
+    _install(monkeypatch, driver, [])
+    monkeypatch.setattr(S, "active_sessions", lambda timeout=None, fresh=False: [])
+
+    result = S.open_new_tab("chrome://extensions/", timeout=1.0)
+
+    assert result["session_id"] == "chrome:profile:44"
+    assert result["client_id"] == "chrome:profile"
+    assert result["operation_id"]
+    assert result["owned"] is True
+
+
+def test_open_new_tab_reconciliation_passes_one_total_deadline(monkeypatch):
+    class DeadlineDriver(_Driver):
+        def newtab(self, **kwargs):
+            self.calls.append(("create", kwargs))
+            raise TimeoutError("create ACK lost")
+
+        def ext_cmd(self, payload, client_id=None, timeout=15.0):
+            self.calls.append((payload, client_id, timeout))
+            assert timeout <= 0.12
+            time.sleep(min(timeout, 0.02))
+            raise TimeoutError("status ACK lost")
+
+    driver = DeadlineDriver(default=None)
+    _install(monkeypatch, driver, [])
+    monkeypatch.setattr(S, "active_sessions", lambda timeout=None, fresh=False: [])
+
+    started = time.monotonic()
+    result = S.open_new_tab("https://deadline.test/", timeout=0.12)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.25
+    assert result["status"] == "unknown"
+    assert result["may_have_created"] is False
+    assert result["retry_safe"] is True
+    assert not any(call[0] == "create" for call in driver.calls)
+
+
+def test_open_new_tab_pins_probe_client_across_default_browser_changes(monkeypatch):
+    class MultiClientDriver(_Driver):
+        def newtab(self, url=None, client_id=None, timeout=15.0, active=True,
+                   operation_id=None):
+            self.calls.append(("create", client_id, operation_id))
+            assert client_id == "chrome:alpha"
+            return {"data": {"status": "pending", "operation_status": "pending",
+                              "operation_id": operation_id, "may_have_created": True,
+                              "retry_safe": False}, "client_id": client_id}
+
+        def ext_cmd(self, payload, client_id=None, timeout=15.0):
+            self.calls.append(("status", client_id, payload["operation_id"]))
+            status_calls = sum(1 for call in self.calls if call[0] == "status")
+            if status_calls == 1:
+                self.default_session_id = "edge:beta:8"
+                return {"data": {"status": "not_found", "operation_status": "not_found",
+                                  "operation_id": payload["operation_id"]},
+                        "client_id": "chrome:alpha"}
+            assert client_id == "chrome:alpha"
+            return {"data": {"status": "loading", "operation_status": "completed",
+                              "operation_id": payload["operation_id"], "id": 45,
+                              "generation": "generation-pinned", "client_id": client_id,
+                              "url": "https://pinned.test/"}, "client_id": client_id}
+
+    driver = MultiClientDriver(default=None)
+    _fresh_tab_ownership(monkeypatch)
+    _install(monkeypatch, driver, [{"id": "chrome:alpha:45",
+                                    "url": "https://pinned.test/", "browser": "chrome",
+                                    "generation": "generation-pinned"}])
+
+    result = S.open_new_tab("https://pinned.test/", timeout=1.0)
+
+    assert result["client_id"] == "chrome:alpha"
+    assert result["session_id"] == "chrome:alpha:45"
+    assert [call[1] for call in driver.calls] == [None, "chrome:alpha", "chrome:alpha"]
+
+
+def test_open_new_tab_pending_ack_reconciles_before_registering_ownership(monkeypatch):
+    class PendingDriver(_Driver):
+        def newtab(self, url=None, client_id=None, timeout=15.0, active=True,
+                   operation_id=None):
+            return {"data": {"status": "pending", "operation_status": "pending",
+                              "operation_id": operation_id, "id": 46,
+                              "generation": "generation-pending", "may_have_created": True,
+                              "retry_safe": False}, "client_id": client_id}
+
+        def ext_cmd(self, payload, client_id=None, timeout=15.0):
+            self.calls.append((payload, client_id, timeout))
+            status_calls = len(self.calls)
+            if status_calls == 1:
+                return {"data": {"status": "not_found", "operation_status": "not_found",
+                                  "operation_id": payload["operation_id"]},
+                        "client_id": "chrome:profile"}
+            assert registry._records == {}
+            return {"data": {"status": "loading", "operation_status": "completed",
+                              "operation_id": payload["operation_id"], "id": 46,
+                              "generation": "generation-pending", "client_id": client_id,
+                              "url": "https://pending-ack.test/"}, "client_id": client_id}
+
+    driver = PendingDriver(default=None)
+    registry = _fresh_tab_ownership(monkeypatch)
+    _install(monkeypatch, driver, [{"id": "chrome:profile:46",
+                                    "url": "https://pending-ack.test/", "browser": "chrome",
+                                    "generation": "generation-pending"}])
+
+    result = S.open_new_tab("https://pending-ack.test/", timeout=1.0)
+
+    assert result["ready"] is True
+    assert result["owned"] is True
+    assert list(registry._records) == ["chrome:profile:46"]
+
+
+def test_open_new_tab_retry_pending_then_missing_stays_unknown(monkeypatch):
+    class RetryPendingDriver(_Driver):
+        def newtab(self, url=None, client_id=None, timeout=15.0, active=True,
+                   operation_id=None):
+            attempts = sum(1 for call in self.calls if call[0] == "create") + 1
+            self.calls.append(("create", operation_id))
+            if attempts == 1:
+                raise TimeoutError("first create was not delivered")
+            return {"data": {"status": "pending", "operation_status": "pending",
+                              "operation_id": operation_id, "may_have_created": True,
+                              "retry_safe": False}, "client_id": client_id}
+
+        def ext_cmd(self, payload, client_id=None, timeout=15.0):
+            self.calls.append(("status", client_id))
+            return {"data": {"status": "not_found", "operation_status": "not_found",
+                              "operation_id": payload["operation_id"],
+                              "may_have_created": False, "retry_safe": True},
+                    "client_id": "chrome:profile"}
+
+    driver = RetryPendingDriver(default=None)
+    _fresh_tab_ownership(monkeypatch)
+    _install(monkeypatch, driver, [])
+
+    result = S.open_new_tab("https://anomalous-registry.test/", timeout=0.08)
+
+    assert result["status"] == "unknown"
+    assert result["may_have_created"] is True
+    assert result["retry_safe"] is False
+    assert result["owned"] is False
+
+
+def test_open_new_tab_preserves_pre_create_storage_failure_semantics(monkeypatch):
+    class StorageFailureDriver(_Driver):
+        def newtab(self, url=None, client_id=None, timeout=15.0, active=True,
+                   operation_id=None):
+            return {"data": {"status": "unknown", "operation_status": "unknown",
+                              "operation_id": operation_id, "may_have_created": False,
+                              "retry_safe": False, "error": "storage write failed"},
+                    "client_id": client_id}
+
+    driver = StorageFailureDriver(default=None)
+    _fresh_tab_ownership(monkeypatch)
+    _install(monkeypatch, driver, [])
+
+    result = S.open_new_tab("https://storage-fail.test/", timeout=0.1)
+
+    assert result["status"] == "unknown"
+    assert result["may_have_created"] is False
+    assert result["retry_safe"] is False
+    assert result["owned"] is False
+
+
+def test_open_new_tab_missing_probe_client_never_matches_numeric_suffix(monkeypatch):
+    class MissingClientDriver(_Driver):
+        def newtab(self, **kwargs):
+            pytest.fail("create must not run without a pinned client")
+
+        def ext_cmd(self, payload, client_id=None, timeout=15.0):
+            return {"data": {"status": "not_found", "operation_status": "not_found",
+                              "operation_id": payload["operation_id"]}}
+
+    driver = MissingClientDriver(default=None)
+    registry = _fresh_tab_ownership(monkeypatch)
+    _install(monkeypatch, driver, [{"id": "edge:other:47", "url": "https://same.test/",
+                                    "browser": "edge", "generation": "generation-other"}])
+
+    result = S.open_new_tab("https://same.test/", timeout=0.1)
+
+    assert result["status"] == "unknown"
+    assert result["session_id"] is None
+    assert result["may_have_created"] is False
+    assert registry._records == {}
 
 
 def test_open_new_tab_registers_generation_bound_agent_ownership(monkeypatch):
     class NewTabDriver(_Driver):
-        def newtab(self, url=None, client_id=None, timeout=15.0, active=True):
-            self.calls.append((url, client_id, timeout, active))
+        def newtab(self, url=None, client_id=None, timeout=15.0, active=True,
+                   operation_id=None):
+            self.calls.append((url, client_id, timeout, active, operation_id))
             return {
                 "data": {
                     "id": 9,
@@ -455,7 +850,11 @@ def test_open_new_tab_registers_generation_bound_agent_ownership(monkeypatch):
                     "generation": "generation-agent",
                     "load_ready": True,
                     "status": "complete",
-                }
+                    "operation_status": "completed",
+                    "operation_id": operation_id,
+                    "client_id": client_id,
+                },
+                "client_id": client_id,
             }
 
     driver = NewTabDriver(responses=[{"data": {"ok": True}}])
@@ -628,14 +1027,20 @@ def test_open_new_tab_does_not_match_same_numeric_id_from_another_browser(
     monkeypatch,
 ):
     class NewTabDriver(_Driver):
-        def newtab(self, url=None, client_id=None, timeout=15.0, active=True):
+        def newtab(self, url=None, client_id=None, timeout=15.0, active=True,
+                   operation_id=None):
             return {
                 "data": {
                     "id": 9,
                     "url": url,
+                    "generation": "generation-new",
                     "load_ready": True,
                     "status": "complete",
-                }
+                    "operation_status": "completed",
+                    "operation_id": operation_id,
+                    "client_id": client_id,
+                },
+                "client_id": client_id,
             }
 
     driver = NewTabDriver(default="chrome:profile:7")
@@ -651,11 +1056,13 @@ def test_open_new_tab_does_not_match_same_numeric_id_from_another_browser(
     assert result["status"] == "pending"
     assert result["session_id"] == "chrome:profile:9"
     assert result["url"] == "https://new.test/"
+    assert result["owned"] is True
 
 
 def test_open_new_tab_pending_still_returns_owned_cleanup_capability(monkeypatch):
     class NewTabDriver(_Driver):
-        def newtab(self, url=None, client_id=None, timeout=15.0, active=True):
+        def newtab(self, url=None, client_id=None, timeout=15.0, active=True,
+                   operation_id=None):
             return {
                 "data": {
                     "id": 9,
@@ -663,7 +1070,11 @@ def test_open_new_tab_pending_still_returns_owned_cleanup_capability(monkeypatch
                     "generation": "generation-pending",
                     "load_ready": False,
                     "status": "loading",
-                }
+                    "operation_status": "completed",
+                    "operation_id": operation_id,
+                    "client_id": client_id,
+                },
+                "client_id": client_id,
             }
 
     driver = NewTabDriver(default="chrome:profile:7")
@@ -683,8 +1094,9 @@ def test_open_new_tab_uses_actual_extension_client_with_zero_scriptable_sessions
     monkeypatch,
 ):
     class NewTabDriver(_Driver):
-        def newtab(self, url=None, client_id=None, timeout=15.0, active=True):
-            assert client_id is None
+        def newtab(self, url=None, client_id=None, timeout=15.0, active=True,
+                   operation_id=None):
+            assert client_id == "chrome:profile"
             return {
                 "data": {
                     "id": 9,
@@ -692,8 +1104,11 @@ def test_open_new_tab_uses_actual_extension_client_with_zero_scriptable_sessions
                     "generation": "generation-zero-session",
                     "load_ready": False,
                     "status": "loading",
+                    "operation_status": "completed",
+                    "operation_id": operation_id,
+                    "client_id": client_id,
                 },
-                "client_id": "chrome:profile",
+                "client_id": client_id,
             }
 
     driver = NewTabDriver(default=None)
@@ -713,7 +1128,8 @@ def test_open_new_tab_does_not_make_an_unbounded_tabs_snapshot_after_deadline(
     monkeypatch,
 ):
     class NewTabDriver(_Driver):
-        def newtab(self, url=None, client_id=None, timeout=15.0, active=True):
+        def newtab(self, url=None, client_id=None, timeout=15.0, active=True,
+                   operation_id=None):
             return {
                 "data": {
                     "id": 9,
@@ -721,7 +1137,11 @@ def test_open_new_tab_does_not_make_an_unbounded_tabs_snapshot_after_deadline(
                     "generation": "generation-pending",
                     "load_ready": False,
                     "status": "loading",
-                }
+                    "operation_status": "completed",
+                    "operation_id": operation_id,
+                    "client_id": client_id,
+                },
+                "client_id": client_id,
             }
 
     driver = NewTabDriver(default="chrome:profile:7")
@@ -741,7 +1161,8 @@ def test_open_new_tab_does_not_make_an_unbounded_tabs_snapshot_after_deadline(
 
 def test_open_new_tab_waits_for_the_returned_tab_generation(monkeypatch):
     class NewTabDriver(_Driver):
-        def newtab(self, url=None, client_id=None, timeout=15.0, active=True):
+        def newtab(self, url=None, client_id=None, timeout=15.0, active=True,
+                   operation_id=None):
             return {
                 "data": {
                     "id": 9,
@@ -749,7 +1170,11 @@ def test_open_new_tab_waits_for_the_returned_tab_generation(monkeypatch):
                     "generation": "generation-new",
                     "load_ready": True,
                     "status": "complete",
-                }
+                    "operation_status": "completed",
+                    "operation_id": operation_id,
+                    "client_id": client_id,
+                },
+                "client_id": client_id,
             }
 
     driver = NewTabDriver(default="chrome:profile:7")
@@ -782,7 +1207,8 @@ def test_open_new_tab_exact_session_registration_is_ready_while_page_loads(
     monkeypatch,
 ):
     class NewTabDriver(_Driver):
-        def newtab(self, url=None, client_id=None, timeout=15.0, active=True):
+        def newtab(self, url=None, client_id=None, timeout=15.0, active=True,
+                   operation_id=None):
             return {
                 "data": {
                     "id": 9,
@@ -790,7 +1216,11 @@ def test_open_new_tab_exact_session_registration_is_ready_while_page_loads(
                     "generation": "generation-loading",
                     "load_ready": False,
                     "status": "loading",
-                }
+                    "operation_status": "completed",
+                    "operation_id": operation_id,
+                    "client_id": client_id,
+                },
+                "client_id": client_id,
             }
 
     driver = NewTabDriver(default="chrome:profile:7")
@@ -818,12 +1248,14 @@ def test_open_new_tab_exact_session_registration_is_ready_while_page_loads(
 
 
 def test_extension_tab_create_ack_does_not_wait_for_page_load():
-    source = BACKGROUND.read_text(encoding="utf-8")
-    start = source.index("async function createTabAck")
-    end = source.index("\n\nasync function handleExtMessage", start)
-    function_source = source[start:end]
+    function_source = _create_operation_source()
     script = f"""
+const stored = {{}};
 const chrome = {{
+  storage: {{ session: {{
+    get: async key => ({{ [key]: stored[key] }}),
+    set: async value => Object.assign(stored, value),
+  }} }},
   tabs: {{
     create: async () => ({{
       id: 19,
@@ -841,7 +1273,7 @@ async function tabGenerationFor() {{ return null; }}
 async function sendTabsUpdate() {{ return new Promise(() => {{}}); }}
 {function_source}
 Promise.race([
-  createTabAck({{url: 'https://slow.test/', active: false}}),
+  createTabAck({{operation_id: 'op-slow', url: 'https://slow.test/', active: false}}),
   new Promise((_, reject) => setTimeout(() => reject(new Error('ack waited for load')), 100)),
 ]).then(result => process.stdout.write(JSON.stringify(result)))
   .catch(error => {{ console.error(error); process.exit(1); }});
@@ -850,24 +1282,24 @@ Promise.race([
         ["node", "-e", script], capture_output=True, text=True, check=True
     )
     result = json.loads(completed.stdout)
-    assert result["data"] == {
-        "id": 19,
-        "generation": "generation-19",
-        "url": "https://slow.test/",
-        "title": "",
-        "windowId": 2,
-        "status": "loading",
-        "load_ready": False,
-    }
+    assert result["data"]["id"] == 19
+    assert result["data"]["generation"] == "generation-19"
+    assert result["data"]["url"] == "https://slow.test/"
+    assert result["data"]["status"] == "loading"
+    assert result["data"]["operation_status"] == "completed"
+    assert result["data"]["load_ready"] is False
 
 
 def test_extension_tab_create_ack_reuses_generation_after_oncreated_finishes():
-    source = BACKGROUND.read_text(encoding="utf-8")
-    start = source.index("async function createTabAck")
-    end = source.index("\n\nasync function handleExtMessage", start)
-    function_source = source[start:end]
+    function_source = _create_operation_source()
     script = f"""
-const chrome = {{ tabs: {{ create: async () => ({{
+const stored = {{}};
+const chrome = {{
+  storage: {{ session: {{
+    get: async key => ({{ [key]: stored[key] }}),
+    set: async value => Object.assign(stored, value),
+  }} }},
+  tabs: {{ create: async () => ({{
   id: 19, pendingUrl: 'https://slow.test/', url: '', title: '', windowId: 2,
   status: 'loading',
 }}) }} }};
@@ -881,7 +1313,7 @@ async function scheduleNewTabGeneration(tabId) {{
 }}
 async function sendTabsUpdate() {{}}
 {function_source}
-createTabAck({{url: 'https://slow.test/'}}).then(result =>
+createTabAck({{operation_id: 'op-generation', url: 'https://slow.test/'}}).then(result =>
   process.stdout.write(JSON.stringify({{result, scheduleCalls}}))
 ).catch(error => {{ console.error(error); process.exit(1); }});
 """
@@ -891,6 +1323,213 @@ createTabAck({{url: 'https://slow.test/'}}).then(result =>
     outcome = json.loads(completed.stdout)
     assert outcome["result"]["data"]["generation"] == "generation-existing"
     assert outcome["scheduleCalls"] == 0
+
+
+def test_extension_create_operation_is_persisted_and_concurrent_requests_deduplicate():
+    function_source = _create_operation_source()
+    script = f"""
+const stored = {{}};
+let createCalls = 0;
+const chrome = {{
+  storage: {{ session: {{
+    get: async (key) => ({{ [key]: stored[key] }}),
+    set: async (value) => Object.assign(stored, value),
+  }} }},
+  tabs: {{ create: async (opts) => {{
+    createCalls += 1;
+    await new Promise(resolve => setTimeout(resolve, 10));
+    return {{ id: 51, pendingUrl: opts.url, url: '', title: 'same', windowId: 3, status: 'loading' }};
+  }} }},
+}};
+async function getClientId() {{ return 'chrome:profile'; }}
+async function tabGenerationFor() {{ return 'generation-51'; }}
+async function scheduleNewTabGeneration() {{ return 'generation-51'; }}
+async function sendTabsUpdate() {{}}
+{function_source}
+(async () => {{
+  const msg = {{ operation_id: 'op-dedup', url: 'https://dedup.test/', active: false }};
+  const [first, second] = await Promise.all([createTabAck(msg), createTabAck(msg)]);
+  const third = await createTabAck(msg);
+  process.stdout.write(JSON.stringify({{ first, second, third, createCalls, stored }}));
+}})().catch(error => {{ console.error(error); process.exit(1); }});
+"""
+    result = _run_node_script(script)
+    assert result["createCalls"] == 1
+    assert result["first"]["data"] == result["second"]["data"] == result["third"]["data"]
+    assert result["stored"]["tmwdCreateOperationsV1"]["op-dedup"]["status"] == "completed"
+
+
+def test_extension_pending_persistence_failure_is_fail_closed():
+    function_source = _create_operation_source()
+    script = f"""
+let createCalls = 0;
+const chrome = {{
+  storage: {{ session: {{
+    get: async () => ({{}}),
+    set: async () => {{ throw new Error('storage write failed'); }},
+  }} }},
+  tabs: {{ create: async () => {{ createCalls += 1; return {{id: 60}}; }} }},
+}};
+async function getClientId() {{ return 'chrome:profile'; }}
+{function_source}
+createTabAck({{operation_id: 'op-write-fail', url: 'https://write-fail.test/'}}).then(result =>
+  process.stdout.write(JSON.stringify({{result, createCalls}}))
+).catch(error => {{ console.error(error); process.exit(1); }});
+"""
+    result = _run_node_script(script)
+    assert result["createCalls"] == 0
+    assert result["result"]["data"]["operation_status"] == "unknown"
+    assert result["result"]["data"]["may_have_created"] is False
+    assert result["result"]["data"]["retry_safe"] is False
+
+
+def test_extension_operation_storage_read_failure_is_unknown_and_does_not_create():
+    function_source = _create_operation_source()
+    script = f"""
+console.log = () => {{}};
+let createCalls = 0;
+const chrome = {{
+  storage: {{ session: {{
+    get: async () => {{ throw new Error('storage read failed'); }},
+    set: async () => {{}},
+  }} }},
+  tabs: {{ create: async () => {{ createCalls += 1; return {{id: 61}}; }} }},
+}};
+{function_source}
+(async () => {{
+  const status = await createTabStatus({{operation_id: 'op-read-fail'}});
+  const create = await createTabAck({{operation_id: 'op-read-fail', url: 'https://read-fail.test/'}});
+  process.stdout.write(JSON.stringify({{status, create, createCalls}}));
+}})().catch(error => {{ console.error(error); process.exit(1); }});
+"""
+    result = _run_node_script(script)
+    assert result["createCalls"] == 0
+    for reply in (result["status"], result["create"]):
+        assert reply["data"]["operation_status"] == "unknown"
+        assert reply["data"]["retry_safe"] is False
+
+
+def test_extension_delayed_create_status_and_duplicate_create_never_double_open():
+    function_source = _create_operation_source()
+    script = f"""
+const stored = {{}};
+let createCalls = 0;
+let releaseCreate;
+const createGate = new Promise(resolve => {{ releaseCreate = resolve; }});
+const chrome = {{
+  storage: {{ session: {{
+    get: async key => ({{ [key]: stored[key] }}),
+    set: async value => Object.assign(stored, value),
+  }} }},
+  tabs: {{ create: async opts => {{
+    createCalls += 1;
+    await createGate;
+    return {{id: 62, pendingUrl: opts.url, url: '', title: '', windowId: 4, status: 'loading'}};
+  }} }},
+}};
+async function getClientId() {{ return 'chrome:profile'; }}
+async function tabGenerationFor() {{ return 'generation-62'; }}
+async function sendTabsUpdate() {{}}
+{function_source}
+(async () => {{
+  const msg = {{operation_id: 'op-interleaved', url: 'https://interleaved.test/'}};
+  const firstPromise = createTabAck(msg);
+  while (createCalls === 0) await new Promise(resolve => setTimeout(resolve, 0));
+  const status = await createTabStatus(msg);
+  const secondPromise = createTabAck(msg);
+  releaseCreate();
+  const [first, second] = await Promise.all([firstPromise, secondPromise]);
+  process.stdout.write(JSON.stringify({{status, first, second, createCalls}}));
+}})().catch(error => {{ console.error(error); process.exit(1); }});
+"""
+    result = _run_node_script(script)
+    assert result["createCalls"] == 1
+    assert result["status"]["data"]["operation_status"] == "pending"
+    assert result["first"]["data"] == result["second"]["data"]
+    assert result["first"]["data"]["operation_status"] == "completed"
+
+
+def test_extension_post_create_failure_remains_pending_and_is_not_retry_safe():
+    function_source = _create_operation_source()
+    script = f"""
+let createCalls = 0;
+const stored = {{}};
+const chrome = {{
+  storage: {{ session: {{
+    get: async key => ({{ [key]: stored[key] }}),
+    set: async value => Object.assign(stored, value),
+  }} }},
+  tabs: {{ create: async opts => {{
+    createCalls += 1;
+    return {{ id: 52, pendingUrl: opts.url, url: '', title: '', windowId: 3, status: 'loading' }};
+  }} }},
+}};
+async function getClientId() {{ return 'chrome:profile'; }}
+async function tabGenerationFor() {{ throw new Error('generation unavailable'); }}
+async function scheduleNewTabGeneration() {{ throw new Error('generation unavailable'); }}
+{function_source}
+(async () => {{
+  const msg = {{ operation_id: 'op-uncertain', url: 'https://uncertain.test/' }};
+  const first = await createTabAck(msg);
+  const second = await createTabAck(msg);
+  process.stdout.write(JSON.stringify({{ first, second, createCalls, stored }}));
+}})().catch(error => {{ console.error(error); process.exit(1); }});
+"""
+    result = _run_node_script(script)
+    assert result["createCalls"] == 1
+    assert result["first"]["data"]["operation_status"] == "pending"
+    assert result["first"]["data"]["may_have_created"] is True
+    assert result["first"]["data"]["retry_safe"] is False
+    assert result["second"]["data"] == result["first"]["data"]
+
+
+def test_tmwebdriver_newtab_forwards_operation_and_client_id(monkeypatch):
+    driver = TMWebDriver.__new__(TMWebDriver)
+    seen = {}
+
+    def ext_cmd(payload, client_id=None, timeout=15):
+        seen.update(payload=payload, client_id=client_id, timeout=timeout)
+        return {"ok": True}
+
+    monkeypatch.setattr(driver, "ext_cmd", ext_cmd)
+    result = driver.newtab(
+        "https://payload.test/", client_id="chrome:profile", operation_id="op-payload",
+        timeout=0.4, active=False,
+    )
+    assert result == {"ok": True}
+    assert seen["payload"] == {
+        "cmd": "tabs", "method": "create", "url": "https://payload.test/",
+        "active": False, "operation_id": "op-payload", "client_id": "chrome:profile",
+    }
+    assert seen["client_id"] == "chrome:profile"
+    assert seen["timeout"] == 0.4
+
+
+def test_extension_pending_create_status_survives_service_worker_restart_without_create():
+    function_source = _create_operation_source()
+    script = f"""
+const stored = {{ tmwdCreateOperationsV1: {{ 'op-pending': {{
+  operation_id: 'op-pending', status: 'pending', url: 'https://pending.test/',
+  client_id: 'chrome:profile', created_at: Date.now(), tab_status: 'pending',
+}} }} }};
+let createCalls = 0;
+const chrome = {{
+  storage: {{ session: {{
+    get: async (key) => ({{ [key]: stored[key] }}),
+    set: async (value) => Object.assign(stored, value),
+  }} }},
+  tabs: {{ create: async () => {{ createCalls += 1; throw new Error('must not create'); }} }},
+}};
+{function_source}
+createTabStatus({{ operation_id: 'op-pending' }}).then(result =>
+  process.stdout.write(JSON.stringify({{ result, createCalls }}))
+).catch(error => {{ console.error(error); process.exit(1); }});
+"""
+    result = _run_node_script(script)
+    assert result["result"]["data"]["status"] == "pending"
+    assert result["result"]["data"]["may_have_created"] is True
+    assert result["result"]["data"]["retry_safe"] is False
+    assert result["createCalls"] == 0
 
 
 def test_extension_tab_updates_publish_stable_lifecycle_generations():
@@ -1000,9 +1639,9 @@ def test_bridge_replaces_same_session_id_when_tab_generation_changes():
     assert current.ws_client is new_client
 
 
-def test_extension_manifest_is_2_1_2():
+def test_extension_manifest_is_2_1_3():
     manifest = json.loads((BACKGROUND.parent / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["version"] == "2.1.2"
+    assert manifest["version"] == "2.1.3"
 
 
 def test_extension_pass2_final_build_is_observable():

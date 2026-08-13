@@ -67,6 +67,122 @@ let tabGenerationsLoadPromise = null;
 let tabGenerationWriteQueue = Promise.resolve();
 let nextTabGeneration = 1;
 
+// Native tab creation is a two-step side effect (create, then record the
+// result). Persist the operation before create so a service-worker restart
+// can reconcile an in-flight operation without issuing a second create.
+const CREATE_OPERATIONS_KEY = 'tmwdCreateOperationsV1'; // gitleaks:allow - storage key, not a credential
+const CREATE_OPERATION_MAX_RECORDS = 256;
+const CREATE_OPERATION_TTL_MS = 24 * 60 * 60 * 1000;
+const createOperations = new Map();
+const createOperationPromises = new Map();
+let createOperationsLoadPromise = null;
+let createOperationsWriteQueue = Promise.resolve();
+
+function pruneCreateOperations() {
+  const cutoff = Date.now() - CREATE_OPERATION_TTL_MS;
+  for (const [operationId, record] of createOperations.entries()) {
+    if (record?.status !== 'pending' && Number(record?.created_at || 0) < cutoff) {
+      createOperations.delete(operationId);
+    }
+  }
+  if (createOperations.size <= CREATE_OPERATION_MAX_RECORDS) return;
+  const ordered = [...createOperations.entries()]
+    .filter(([, record]) => record?.status !== 'pending')
+    .sort((a, b) => Number(a[1]?.created_at || 0) - Number(b[1]?.created_at || 0));
+  for (const [operationId] of ordered.slice(0, Math.max(0, createOperations.size - CREATE_OPERATION_MAX_RECORDS))) {
+    createOperations.delete(operationId);
+  }
+}
+
+function persistCreateOperations() {
+  const area = chrome.storage?.session;
+  if (!area) return Promise.reject(new Error('chrome.storage.session is unavailable'));
+  pruneCreateOperations();
+  const snapshot = Object.fromEntries(
+    [...createOperations.entries()].map(([id, record]) => [id, {
+      operation_id: record.operation_id,
+      status: record.status,
+      url: record.url,
+      client_id: record.client_id || null,
+      id: record.id ?? null,
+      generation: record.generation || null,
+      title: record.title || '',
+      windowId: record.windowId ?? null,
+      tab_status: record.tab_status || 'unknown',
+      load_ready: Boolean(record.load_ready),
+      created_at: record.created_at || Date.now(),
+    }]),
+  );
+  const write = createOperationsWriteQueue
+    .catch(() => {})
+    .then(() => area.set({ [CREATE_OPERATIONS_KEY]: snapshot }));
+  createOperationsWriteQueue = write;
+  return write;
+}
+
+async function loadCreateOperations() {
+  if (createOperationsLoadPromise) return await createOperationsLoadPromise;
+  createOperationsLoadPromise = (async () => {
+    try {
+      const area = chrome.storage?.session;
+      if (!area) throw new Error('chrome.storage.session is unavailable');
+      const stored = (await area.get(CREATE_OPERATIONS_KEY))[CREATE_OPERATIONS_KEY] || {};
+      for (const [operationId, record] of Object.entries(stored)) {
+        if (record && typeof record === 'object') {
+          createOperations.set(String(operationId), { ...record, operation_id: String(operationId) });
+        }
+      }
+      pruneCreateOperations();
+    } catch (error) {
+      console.log('[TMWD-WS] create operation storage unavailable', error);
+      throw error;
+    }
+    return createOperations;
+  })();
+  return await createOperationsLoadPromise;
+}
+
+function operationRecordData(record) {
+  return {
+    operation_id: record.operation_id,
+    // Keep the historical status field as the native tab load status. The
+    // operation state is explicit so old callers do not mistake a loading tab
+    // for a missing operation.
+    status: record.tab_status || 'unknown',
+    operation_status: record.status || 'unknown',
+    id: record.id,
+    generation: record.generation,
+    url: record.url,
+    title: record.title || '',
+    windowId: record.windowId,
+    tab_status: record.tab_status || 'unknown',
+    load_ready: Boolean(record.load_ready),
+    client_id: record.client_id || null,
+    may_have_created: record.status === 'pending',
+    retry_safe: record.status === 'not_found',
+  };
+}
+
+async function createTabStatus(msg) {
+  const operationId = String(msg.operation_id || '');
+  if (!operationId) return { ok: false, error: 'create_status requires operation_id' };
+  try {
+    await loadCreateOperations();
+  } catch (error) {
+    return { ok: true, data: {
+      status: 'unknown', operation_status: 'unknown', operation_id: operationId,
+      may_have_created: true, retry_safe: false,
+      error: error.message || String(error),
+    } };
+  }
+  const record = createOperations.get(operationId);
+  if (!record) return { ok: true, data: {
+    status: 'not_found', operation_status: 'not_found', operation_id: operationId,
+    may_have_created: false, retry_safe: true,
+  } };
+  return { ok: true, data: operationRecordData(record) };
+}
+
 function newTabGeneration() {
   const random = globalThis.crypto?.randomUUID?.() || Math.random().toString(36).slice(2);
   return `${Date.now().toString(36)}-${nextTabGeneration++}-${random}`;
@@ -1862,32 +1978,122 @@ async function handleDownloadCommand(msg) {
 }
 
 async function createTabAck(msg) {
-  // Creation acknowledgement must not wait for the destination document to
-  // finish loading.  The caller has one total deadline for both this transport
-  // reply and the exact session+generation registration; consuming that same
-  // budget here makes a successful chrome.tabs.create look like a timeout and
-  // leaves the caller without the ownership capability needed for cleanup.
-  const tab = await chrome.tabs.create({
-    url: msg.url || 'about:blank',
-    active: msg.active !== false,
-  });
-  // Reuse a generation already assigned by onCreated. If its callback has not
-  // run yet, tabGenerationFor establishes the generation and onCreated will
-  // observe it instead of replacing the ACK's lifecycle identity.
-  let generation;
-  try { generation = await tabGenerationFor(tab.id); } catch (_) {}
-  if (!generation) generation = await scheduleNewTabGeneration(tab.id);
-  void sendTabsUpdate();
-  const currentUrl = tab.pendingUrl || tab.url || msg.url || 'about:blank';
-  return { ok: true, data: {
-    id: tab.id,
-    generation,
-    url: currentUrl,
-    title: tab.title || '',
-    windowId: tab.windowId,
-    status: tab.status || 'unknown',
-    load_ready: Boolean(tab.status === 'complete' && currentUrl),
-  } };
+  const operationId = String(msg.operation_id || '').trim();
+  if (!operationId) {
+    return { ok: false, error: 'tabs.create requires operation_id' };
+  }
+  try {
+    await loadCreateOperations();
+  } catch (error) {
+    return { ok: true, data: {
+      status: 'unknown', operation_status: 'unknown', operation_id: operationId,
+      may_have_created: false, retry_safe: false,
+      error: error.message || String(error),
+    } };
+  }
+  const inFlight = createOperationPromises.get(operationId);
+  if (inFlight) return await inFlight;
+  const existing = createOperations.get(operationId);
+  if (existing && existing.status === 'completed') {
+    return { ok: true, data: operationRecordData(existing) };
+  }
+  if (existing && existing.status === 'pending') {
+    return { ok: true, data: operationRecordData(existing) };
+  }
+  const run = (async () => {
+    const clientId = msg.client_id || msg.clientId
+      || (typeof getClientId === 'function' ? await getClientId() : null);
+    const pending = {
+      operation_id: operationId,
+      status: 'pending',
+      url: msg.url || 'about:blank',
+      client_id: clientId,
+      created_at: Date.now(),
+      tab_status: 'pending',
+      load_ready: false,
+    };
+    createOperations.set(operationId, pending);
+    // This write intentionally precedes chrome.tabs.create. If the worker is
+    // evicted after create but before completion is saved, reconciliation sees
+    // pending and returns unknown rather than opening a second tab.
+    try {
+      await persistCreateOperations();
+    } catch (error) {
+      createOperations.delete(operationId);
+      return { ok: true, data: {
+        status: 'unknown', operation_status: 'unknown', operation_id: operationId,
+        may_have_created: false, retry_safe: false,
+        error: error.message || String(error),
+      } };
+    }
+    let tab = null;
+    try {
+      // Creation acknowledgement must not wait for the destination document.
+      tab = await chrome.tabs.create({
+        url: pending.url,
+        active: msg.active !== false,
+      });
+      let generation;
+      try { generation = await tabGenerationFor(tab.id); } catch (_) {}
+      if (!generation) generation = await scheduleNewTabGeneration(tab.id);
+      const currentUrl = tab.pendingUrl || tab.url || pending.url;
+      const completed = {
+        ...pending,
+        status: 'completed',
+        id: tab.id,
+        generation,
+        url: currentUrl,
+        title: tab.title || '',
+        windowId: tab.windowId,
+        tab_status: tab.status || 'unknown',
+        load_ready: Boolean(tab.status === 'complete' && currentUrl),
+      };
+      createOperations.set(operationId, completed);
+      await persistCreateOperations();
+      void sendTabsUpdate();
+      return { ok: true, data: operationRecordData(completed) };
+    } catch (error) {
+      if (tab && tab.id !== undefined && tab.id !== null) {
+        // The native side effect already happened. Any failure while
+        // assigning generation or persisting the completion is ambiguous;
+        // preserve pending so reconciliation can never issue a second create.
+        const uncertain = {
+          ...pending,
+          id: tab.id,
+          generation: pending.generation || null,
+          url: tab.pendingUrl || tab.url || pending.url,
+          title: tab.title || '',
+          windowId: tab.windowId,
+          tab_status: tab.status || 'unknown',
+          error: error.message || String(error),
+        };
+        createOperations.set(operationId, uncertain);
+        try { await persistCreateOperations(); } catch (_) {}
+        return { ok: true, data: operationRecordData(uncertain) };
+      }
+      const failed = {
+        ...pending,
+        status: 'not_found',
+        tab_status: 'unknown',
+        error: error.message || String(error),
+      };
+      createOperations.set(operationId, failed);
+      try { await persistCreateOperations(); } catch (_) {
+        return { ok: true, data: {
+          status: 'unknown', operation_status: 'unknown', operation_id: operationId,
+          may_have_created: false, retry_safe: false,
+          error: failed.error,
+        } };
+      }
+      return { ok: false, error: failed.error, data: {
+        status: 'not_found', operation_status: 'not_found',
+        operation_id: operationId, retry_safe: true,
+      } };
+    }
+  })();
+  createOperationPromises.set(operationId, run);
+  try { return await run; }
+  finally { createOperationPromises.delete(operationId); }
 }
 
 async function handleExtMessage(msg, sender) {
@@ -1971,6 +2177,8 @@ async function handleExtMessage(msg, sender) {
         return { ok: true, data: await closeTabsWithGenerations(
           tabIds, msg.expectedGenerations,
         ) };
+      } else if (msg.method === 'create_status') {
+        return await createTabStatus(msg);
       } else if (msg.method === 'create') {
         // Native tab creation — runs in the SW, so it needs NO existing tab.
         // This replaces the old GM_openInTab path (a Tampermonkey API that
