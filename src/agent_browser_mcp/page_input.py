@@ -205,6 +205,7 @@ def type_commands(
     *,
     select_all: bool = False,
     submit_key: str | None = None,
+    submit_delay_ms: int = 0,
 ) -> list[dict[str, Any]]:
     """Focus a matching element, insert text, and optionally submit a key.
 
@@ -216,12 +217,30 @@ def type_commands(
     """
     if not isinstance(text, str):
         raise InputValidationError("text must be a string")
+    if (
+        isinstance(submit_delay_ms, bool)
+        or not isinstance(submit_delay_ms, int)
+        or submit_delay_ms < 0
+    ):
+        raise InputValidationError("submit_delay_ms must be a non-negative integer")
     expression = type_target_script(selector, select_all=select_all)
     commands = [
         _command("Runtime.evaluate", expression=expression, returnByValue=True),
         _command("Input.insertText", text=text),
     ]
     if submit_key is not None:
+        if submit_delay_ms:
+            commands.append(
+                _command(
+                    "Runtime.evaluate",
+                    expression=(
+                        "new Promise(resolve => setTimeout(resolve, "
+                        f"{submit_delay_ms}))"
+                    ),
+                    awaitPromise=True,
+                    returnByValue=True,
+                )
+            )
         commands.extend(press_commands(submit_key))
     return commands
 

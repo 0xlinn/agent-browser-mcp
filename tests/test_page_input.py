@@ -108,6 +108,27 @@ def test_type_focuses_selects_and_optionally_submits():
     assert commands[1]["params"]["text"] == "hello"
 
 
+def test_type_can_await_xterm_delivery_before_submitting():
+    commands = type_commands(
+        ".xterm",
+        "printf 'abm'",
+        submit_key="enter",
+        submit_delay_ms=75,
+    )
+
+    assert [command["method"] for command in commands] == [
+        "Runtime.evaluate",
+        "Input.insertText",
+        "Runtime.evaluate",
+        "Input.dispatchKeyEvent",
+        "Input.dispatchKeyEvent",
+    ]
+    delay = commands[2]["params"]
+    assert delay["expression"] == "new Promise(resolve => setTimeout(resolve, 75))"
+    assert delay["awaitPromise"] is True
+    assert delay["returnByValue"] is True
+
+
 def test_type_retargets_xterm_container_to_helper_textarea():
     commands = type_commands(".xterm", "printf 'abm'", submit_key="enter")
     expression = commands[0]["params"]["expression"]

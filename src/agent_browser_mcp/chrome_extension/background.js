@@ -1315,10 +1315,11 @@ function debuggerTargetKey(target) {
   throw new Error('debugger target is missing an identifier');
 }
 
-function boundedCdpTimeout(value, fallback = 20000) {
+function boundedCdpTimeout(value, fallback = 20000, minimum = 100) {
   const requested = Number(value);
+  const lowerBound = Math.max(1, Math.floor(Number(minimum) || 100));
   return Number.isFinite(requested) && requested > 0
-    ? Math.max(100, Math.min(Math.floor(requested), 120000))
+    ? Math.max(lowerBound, Math.min(Math.floor(requested), 120000))
     : fallback;
 }
 
@@ -1526,7 +1527,7 @@ async function forceInvalidateDebuggerAttachment(
 }
 
 async function sendDebuggerCommandWithTimeout(
-  lease, method, params = {}, timeoutMs = 20000,
+  lease, method, params = {}, timeoutMs = 20000, minimumTimeoutMs = 100,
 ) {
   if (!lease?.attachment || lease.released || lease.attachment.invalidated ||
       lease.generation !== lease.attachment.generation) {
@@ -1535,7 +1536,7 @@ async function sendDebuggerCommandWithTimeout(
     throw error;
   }
   const attachment = lease.attachment;
-  const bounded = boundedCdpTimeout(timeoutMs);
+  const bounded = boundedCdpTimeout(timeoutMs, 20000, minimumTimeoutMs);
   const commandState = {
     lease,
     timer: null,
@@ -2027,13 +2028,13 @@ async function createTabAck(msg) {
       } };
     }
     let tab = null;
+    let generation = null;
     try {
       // Creation acknowledgement must not wait for the destination document.
       tab = await chrome.tabs.create({
         url: pending.url,
         active: msg.active !== false,
       });
-      let generation;
       try { generation = await tabGenerationFor(tab.id); } catch (_) {}
       if (!generation) generation = await scheduleNewTabGeneration(tab.id);
       const currentUrl = tab.pendingUrl || tab.url || pending.url;
@@ -2060,7 +2061,7 @@ async function createTabAck(msg) {
         const uncertain = {
           ...pending,
           id: tab.id,
-          generation: pending.generation || null,
+          generation: generation || pending.generation || null,
           url: tab.pendingUrl || tab.url || pending.url,
           title: tab.title || '',
           windowId: tab.windowId,
@@ -2495,6 +2496,16 @@ async function handleCookies(msg, sender) {
   }
 }
 
+function batchDeadlineRemainingMs(msg, stage) {
+  const deadlineEpochMs = Number(msg.deadlineEpochMs);
+  if (!Number.isFinite(deadlineEpochMs) || deadlineEpochMs <= 0) return null;
+  const remaining = Math.floor(deadlineEpochMs - Date.now());
+  if (remaining > 0) return remaining;
+  const error = new Error(`cdp_timeout: batch deadline exhausted ${stage}`);
+  error.code = 'cdp_timeout';
+  throw error;
+}
+
 async function handleBatch(msg, sender) {
   const R = [];
   let attachedTabId = null;
@@ -2502,7 +2513,9 @@ async function handleBatch(msg, sender) {
   const resolve$N = (params) => JSON.parse(JSON.stringify(params || {}).replace(/"\$(\d+)\.([^"]+)"/g,
     (_, i, path) => { let v = R[+i]; for (const k of path.split('.')) v = v[k]; return JSON.stringify(v); }));
   try {
+    batchDeadlineRemainingMs(msg, 'before batch start');
     for (const c of msg.commands) {
+      batchDeadlineRemainingMs(msg, `before ${c.method || c.cmd || 'command'}`);
       if (c.tabId === undefined && msg.tabId !== undefined) c.tabId = msg.tabId;
       if (c.cmd === 'cookies') {
         R.push(await handleCookies(c, sender));
@@ -2520,10 +2533,14 @@ async function handleBatch(msg, sender) {
           }
           debuggerLease = await attachAbmDebugger({ tabId });
           attachedTabId = tabId;
+          batchDeadlineRemainingMs(msg, `after attaching for ${c.method}`);
         }
+        const remaining = batchDeadlineRemainingMs(msg, `before dispatching ${c.method}`);
+        const requestedTimeout = boundedCdpTimeout(c.timeoutMs ?? msg.timeoutMs);
         R.push(await sendDebuggerCommandWithTimeout(
           debuggerLease, c.method, resolve$N(c.params),
-          boundedCdpTimeout(c.timeoutMs ?? msg.timeoutMs),
+          remaining === null ? requestedTimeout : Math.min(requestedTimeout, remaining),
+          remaining === null ? 100 : 1,
         ));
       } else {
         R.push({ ok: false, error: 'unknown cmd: ' + c.cmd });

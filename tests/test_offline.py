@@ -587,7 +587,88 @@ def test_page_type_uses_already_validated_session_for_input(monkeypatch):
     assert result["target_kind"] == "xterm"
     assert len(calls) == 2
     assert all(call[1] == "c:target" for call in calls)
+    batch = json.loads(calls[1][0])
+    assert [command["method"] for command in batch["commands"]] == [
+        "Input.insertText",
+        "Runtime.evaluate",
+        "Input.dispatchKeyEvent",
+        "Input.dispatchKeyEvent",
+    ]
+    assert batch["commands"][1]["params"]["awaitPromise"] is True
     assert driver.default_session_id == "c:previous"
+
+
+def test_page_type_xterm_submit_does_not_start_when_deadline_cannot_fit_delay(
+    monkeypatch,
+):
+    class _D:
+        default_session_id = "c:previous"
+
+    driver = _D()
+    calls = []
+    monotonic_values = [100.0, 100.0, 100.0, 100.0, 100.079]
+
+    def fake_monotonic():
+        if len(monotonic_values) > 1:
+            return monotonic_values.pop(0)
+        return monotonic_values[0]
+
+    monkeypatch.setattr(S.time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(S, "require_driver", lambda: driver)
+    monkeypatch.setattr(
+        S,
+        "ensure_sessions",
+        lambda timeout=None, fresh=False, prune_default=True: [
+            {"id": "c:target", "url": "https://example.test/"}
+        ],
+    )
+
+    def fake_exec_js(script, session_id=None, timeout=15.0):
+        calls.append((script, session_id, timeout))
+        return {"data": {"found": True, "targetKind": "xterm"}}
+
+    monkeypatch.setattr(S, "exec_js", fake_exec_js)
+
+    with pytest.raises(TimeoutError, match="xterm submit delay"):
+        S.page_type(
+            "must-not-land",
+            selector=".xterm",
+            submit_key="enter",
+            session_id="c:target",
+            timeout=0.08,
+        )
+
+    assert len(calls) == 1
+    assert driver.default_session_id == "c:previous"
+
+
+def test_page_input_batch_carries_the_same_absolute_deadline(monkeypatch):
+    class _D:
+        default_session_id = "c:previous"
+
+    calls = []
+    monkeypatch.setattr(S, "require_driver", lambda: _D())
+    monkeypatch.setattr(S.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(S.time, "time", lambda: 200.0)
+
+    def fake_exec_js(script, session_id=None, timeout=15.0):
+        calls.append((json.loads(script), session_id, timeout))
+        return {"data": [{"ok": True}]}
+
+    monkeypatch.setattr(S, "exec_js", fake_exec_js)
+
+    S._run_page_input(
+        [{"cmd": "cdp", "method": "Input.insertText", "params": {"text": "x"}}],
+        "c:target",
+        0.2,
+        session_validated=True,
+        deadline=100.2,
+    )
+
+    payload, session_id, timeout = calls[0]
+    assert payload["deadlineEpochMs"] in {200199, 200200}
+    assert session_id == "c:target"
+    assert timeout == pytest.approx(0.2)
 
 
 def test_driver_does_not_dispatch_when_session_recovers_at_deadline(monkeypatch):
@@ -751,8 +832,8 @@ def test_page_click_stall_block_resets_after_window_expires(monkeypatch):
     sid = "c:challenge-window-reset"
     marker = "https://example.test|/protected|iframe|challenge|turnstile"
     batches = []
-    ticks = iter([1.0, 2.0, 3.0, 4.0, 5.0, 125.0, 126.0])
-    monkeypatch.setattr(S.time, "monotonic", lambda: next(ticks))
+    clock = [1.0]
+    monkeypatch.setattr(S.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(S, "require_driver", lambda: _D())
     monkeypatch.setattr(S, "active_sessions", lambda timeout=None, fresh=False: [
         {"id": sid, "url": "https://example.test/protected"},
@@ -772,6 +853,7 @@ def test_page_click_stall_block_resets_after_window_expires(monkeypatch):
     assert S.page_click(selector="iframe", session_id=sid)["attempts"] == 1
     assert S.page_click(selector="iframe", session_id=sid)["attempts"] == 2
     assert S.page_click(selector="iframe", session_id=sid)["status"] == "challenge_stalled"
+    clock[0] = 121.0
     after_window = S.page_click(selector="iframe", session_id=sid)
 
     assert after_window["status"] == "success"

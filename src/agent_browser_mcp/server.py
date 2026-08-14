@@ -85,6 +85,7 @@ _DEFAULT_AUTO_BEFOREUNLOAD_HOSTS = (
 _LAB_APPROVAL_OWNERS: dict[str, Any] = {}
 _LAB_PHYSICAL_APPROVALS: set[str] = set()
 _LAB_SITE_PERMISSION_APPROVALS: set[str] = set()
+_XTERM_SUBMIT_DELAY_MS = 75
 
 
 class _TabOwnershipRegistry:
@@ -3421,10 +3422,13 @@ def _run_page_input(
     timeout: float,
     *,
     session_validated: bool = False,
+    deadline: Optional[float] = None,
 ) -> dict[str, Any]:
     """Dispatch one uninterrupted CDP input sequence to one resolved tab."""
     if not commands:
         raise InputValidationError("page input commands must not be empty")
+    if deadline is None:
+        deadline = time.monotonic() + timeout
     driver = require_driver()
     prev_default = driver.default_session_id
     directed = session_id is not None
@@ -3441,8 +3445,20 @@ def _run_page_input(
             target_session = (
                 switch_session(session_id=session_id) if directed else switch_session()
             )
-        payload = {"cmd": "batch", "commands": commands}
-        response = exec_js(json.dumps(payload), session_id=target_session, timeout=timeout)
+        wall_now_ms = time.time() * 1000
+        remaining = max(0.0, deadline - time.monotonic())
+        if remaining <= 0:
+            raise TimeoutError("page input deadline exhausted before batch dispatch")
+        payload = {
+            "cmd": "batch",
+            "commands": commands,
+            # The extension uses the absolute deadline to stop a batch whose
+            # transport ACK or an earlier CDP command consumed the budget.
+            "deadlineEpochMs": int(wall_now_ms + remaining * 1000),
+        }
+        response = exec_js(
+            json.dumps(payload), session_id=target_session, timeout=remaining
+        )
         return {
             "status": "success",
             "session_id": target_session,
@@ -3731,25 +3747,39 @@ def page_type(
                 "target_kind": target_info.get("targetKind", "missing"),
                 "typed_chars": 0,
             }
+        target_kind = target_info.get("targetKind", "element")
+        submit_delay_ms = (
+            _XTERM_SUBMIT_DELAY_MS
+            if target_kind == "xterm" and submit_key
+            else 0
+        )
         input_budget = max(0.0, deadline - time.monotonic())
         if input_budget <= 0:
             raise TimeoutError("page_type deadline exhausted before input dispatch")
+        if submit_delay_ms and input_budget <= submit_delay_ms / 1000:
+            raise TimeoutError(
+                "page_type deadline cannot fit the xterm submit delay"
+            )
         # The resolver above focused/selected the exact sink. Dispatch only the
         # trusted text/key portion after it positively identified a target.
+        # Xterm forwards insertText to its backend asynchronously, so yield once
+        # before Enter without breaking the single attached CDP batch.
         commands = type_commands(
             selector,
             text,
             select_all=clear,
             submit_key=submit_key or None,
+            submit_delay_ms=submit_delay_ms,
         )[1:]
         out = _run_page_input(
             commands,
             target_session,
             input_budget,
             session_validated=True,
+            deadline=deadline,
         )
         out["target"] = target
-        out["target_kind"] = target_info.get("targetKind", "element")
+        out["target_kind"] = target_kind
         out["typed_chars"] = len(text)
         return out
     finally:

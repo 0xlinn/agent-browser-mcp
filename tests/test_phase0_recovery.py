@@ -50,6 +50,13 @@ def _create_operation_source() -> str:
     return source[prefix_start:prefix_end] + "\n" + source[create_start:create_end]
 
 
+def _batch_source() -> str:
+    source = BACKGROUND.read_text(encoding="utf-8")
+    start = source.index("function batchDeadlineRemainingMs")
+    end = source.index("\n\nasync function handleCDP", start)
+    return source[start:end]
+
+
 class _Driver:
     def __init__(self, responses=None, default="chrome:profile:7"):
         self.default_session_id = default
@@ -304,7 +311,7 @@ def test_open_url_unknown_command_fallback_uses_one_total_deadline(monkeypatch):
     _install(monkeypatch, driver)
 
     result = S.open_url(
-        "https://new.test/", session_id="chrome:profile:7", timeout=0.08
+        "https://new.test/", session_id="chrome:profile:7", timeout=0.2
     )
 
     assert result["navigation_mode"] == "cdp_fallback"
@@ -1736,6 +1743,99 @@ async function scheduleNewTabGeneration() {{ throw new Error('generation unavail
     assert result["first"]["data"]["may_have_created"] is True
     assert result["first"]["data"]["retry_safe"] is False
     assert result["second"]["data"] == result["first"]["data"]
+
+
+def test_extension_completion_persistence_failure_preserves_generation():
+    function_source = _create_operation_source()
+    script = f"""
+let createCalls = 0;
+let writeCalls = 0;
+const stored = {{}};
+const chrome = {{
+  storage: {{ session: {{
+    get: async key => ({{ [key]: stored[key] }}),
+    set: async value => {{
+      writeCalls += 1;
+      if (writeCalls === 2) throw new Error('completion write failed');
+      Object.assign(stored, value);
+    }},
+  }} }},
+  tabs: {{ create: async opts => {{
+    createCalls += 1;
+    return {{ id: 53, pendingUrl: opts.url, url: '', title: '', windowId: 3, status: 'loading' }};
+  }} }},
+}};
+async function getClientId() {{ return 'chrome:profile'; }}
+async function tabGenerationFor() {{ return 'generation-53'; }}
+async function scheduleNewTabGeneration() {{ throw new Error('generation should already exist'); }}
+{function_source}
+(async () => {{
+  const result = await createTabAck({{
+    operation_id: 'op-completion-write-fail', url: 'https://write-fail.test/',
+  }});
+  process.stdout.write(JSON.stringify({{ result, createCalls, writeCalls, stored }}));
+}})().catch(error => {{ console.error(error); process.exit(1); }});
+"""
+    result = _run_node_script(script)
+    operation = result["result"]["data"]
+    assert result["createCalls"] == 1
+    assert result["writeCalls"] == 3
+    assert operation["operation_status"] == "pending"
+    assert operation["generation"] == "generation-53"
+    assert operation["may_have_created"] is True
+    assert operation["retry_safe"] is False
+    assert result["stored"]["tmwdCreateOperationsV1"][
+        "op-completion-write-fail"
+    ]["generation"] == "generation-53"
+
+
+def test_extension_batch_deadline_stops_enter_after_delayed_command():
+    batch_source = _batch_source()
+    script = f"""
+let now = 1000;
+Date.now = () => now;
+const calls = [];
+async function attachAbmDebugger(target) {{
+  return {{ attachment: {{ target }}, released: false }};
+}}
+async function detachAbmDebugger(lease) {{ lease.released = true; }}
+function boundedCdpTimeout(value, fallback = 20000) {{
+  const requested = Number(value);
+  return Number.isFinite(requested) && requested > 0 ? requested : fallback;
+}}
+function debuggerFailureCode(error) {{ return error.code || 'cdp_error'; }}
+async function sendDebuggerCommandWithTimeout(
+  _lease, method, _params, timeoutMs, minimumMs
+) {{
+  calls.push({{ method, timeoutMs, minimumMs }});
+  if (method === 'Runtime.evaluate') now += 80;
+  return {{}};
+}}
+{batch_source}
+(async () => {{
+  const result = await handleBatch({{
+    tabId: 53,
+    deadlineEpochMs: 1050,
+    commands: [
+      {{ cmd: 'cdp', method: 'Input.insertText', params: {{ text: 'deadline-test' }} }},
+      {{ cmd: 'cdp', method: 'Runtime.evaluate', params: {{ expression: 'delay' }} }},
+      {{ cmd: 'cdp', method: 'Input.dispatchKeyEvent', params: {{ type: 'keyDown', key: 'Enter' }} }},
+      {{ cmd: 'cdp', method: 'Input.dispatchKeyEvent', params: {{ type: 'keyUp', key: 'Enter' }} }},
+    ],
+  }}, {{}});
+  process.stdout.write(JSON.stringify({{ result, calls }}));
+}})().catch(error => {{ console.error(error); process.exit(1); }});
+"""
+    outcome = _run_node_script(script)
+
+    assert outcome["result"]["ok"] is False
+    assert outcome["result"]["code"] == "cdp_timeout"
+    assert [call["method"] for call in outcome["calls"]] == [
+        "Input.insertText",
+        "Runtime.evaluate",
+    ]
+    assert all(call["timeoutMs"] <= 50 for call in outcome["calls"])
+    assert all(call["minimumMs"] == 1 for call in outcome["calls"])
 
 
 def test_tmwebdriver_newtab_forwards_operation_and_client_id(monkeypatch):
